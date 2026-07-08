@@ -5,6 +5,7 @@ from models import build_patch_discriminator, build_unet
 from .base import BaseI2ITrainer
 from .edm import EDMTrainer
 from .i2i_rfr import I2IRFRTrainer
+from .i2i_rfr_x0 import I2IRFRX0Trainer
 from .pix2pix import Pix2PixTrainer
 from .rectified_flow import RectifiedFlowTrainer
 from .regression import RegressionTrainer
@@ -16,6 +17,7 @@ MODEL_REGISTRY = {
     "edm": EDMTrainer,
     "rectified_flow": RectifiedFlowTrainer,
     "i2i_rfr": I2IRFRTrainer,
+    "i2i_rfr_x0": I2IRFRX0Trainer,
 }
 
 
@@ -42,8 +44,8 @@ def build_trainer(cfg, input_shape) -> BaseI2ITrainer:
 
     # アルゴリズムによってgeneratorの入力チャンネル数が変わる
     # edm: [ノイズ入りtarget, source, ノイズレベル] の3チャンネル
-    # rectified_flow / i2i_rfr: [x_t, source, 時刻t] の3チャンネル
-    in_ch = 3 if name in ("edm", "rectified_flow", "i2i_rfr") else 1
+    # rectified_flow / i2i_rfr / i2i_rfr_x0: [x_t, source, 時刻t] の3チャンネル
+    in_ch = 3 if name in ("edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0") else 1
     gen_input_shape = tuple(input_shape[:3]) + (in_ch,)
     generator = build_unet(
         gen_input_shape, cfg.model.num_channel, **cfg.model.unet, **cfg.model.renorm
@@ -62,6 +64,8 @@ def build_trainer(cfg, input_shape) -> BaseI2ITrainer:
         trainer = RectifiedFlowTrainer(generator)
     elif name == "i2i_rfr":
         trainer = I2IRFRTrainer(generator)
+    elif name == "i2i_rfr_x0":
+        trainer = I2IRFRX0Trainer(generator)
     else:
         raise NotImplementedError(
             f"Unknown algorithm: {name}. Available: {list(MODEL_REGISTRY.keys())}"
@@ -79,6 +83,7 @@ __all__ = [
     "EDMTrainer",
     "RectifiedFlowTrainer",
     "I2IRFRTrainer",
+    "I2IRFRX0Trainer",
     "MODEL_REGISTRY",
     "build_trainer",
     "attach_aux_optimizers",

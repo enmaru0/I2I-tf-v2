@@ -31,6 +31,8 @@ data:
   # paired_dir: source(data_dir) と target(target_data_dir) を別フォルダの同名ファイルで対応
   # self_noise: クリーン画像1枚から source=クリーン+合成ノイズ / target=クリーン を作る
   #             （ペア画像が無い自己教師デノイジング。targetファイル不要）
+  # self_sr: クリーン画像1枚から source=スライス方向低解像度シミュレーション / target=クリーン
+  #          を作る（through-plane SRの自己教師学習。targetファイル不要）
   mode: paired
   # pairedモード: sourceが xxx.hdr のとき target は xxx.target.hdr
   target_suffix: ".target"
@@ -51,11 +53,25 @@ data:
       prob: 0.0 # 学習時に適用する確率。0で無効
       length_range: [3.0, 9.0] # 学習時のブレ長さ範囲
       val_length: 0.0 # 検証時の固定長さ（0で無効。方向はファイル毎にシード固定）
+  # through-plane SR (data.mode=self_sr のときに使用)
+  # 劣化は「スライスプロファイルぼかし→スライス間隔で間引き→元グリッドへ補間」の順
+  # （edm-torchのThroughPlaneSuperResolution physicalモード相当）
+  # 間隔・厚みのpx換算はアフィン変換後のスペーシング(aug.affine.norm_spacing_zyx)基準
+  self_sr:
+    axes: [AX] # 学習時に劣化させる軸をここからランダム選択（AX=z / COR=y / SAG=x）
+    slice_interval_mm_range: [2.0, 6.0] # 撮像スライス間隔[mm]（学習時はこの範囲でランダム）
+    slice_thickness_mm_range: [1.0, 6.0] # スライス厚[mm]（学習時はこの範囲でランダム）
+    clamp_thickness_to_interval: true # スライス厚を間隔以下に制限する
+    slice_profile: gaussian # gaussian(FWHM=スライス厚) / box(幅=スライス厚) / none
+    slice_interpolation: linear # linear or spline（間引き・元グリッドへ戻す補間）
+    val_axis: AX # 検証時の固定軸
+    val_slice_interval_mm: 4.0 # 検証時の固定スライス間隔[mm]
+    val_slice_thickness_mm: 4.0 # 検証時の固定スライス厚[mm]
 
 # 画像変換アルゴリズムの選択と設定
 # 比較実験は --overrides algorithm.name=pix2pix exp_dir=results/pix2pix のように行う
 algorithm:
-  name: regression # regression / pix2pix / edm / rectified_flow / i2i_rfr
+  name: regression # regression / pix2pix / edm / rectified_flow / i2i_rfr / i2i_rfr_x0
   regression:
     # residual: pred = source + logits (デノイズ・ぼかし修正におすすめ)
     # direct: pred = sigmoid(logits)
@@ -98,6 +114,13 @@ algorithm:
     time_sampling: uniform
     logit_normal_mean: 0.0
     logit_normal_std: 1.0
+  i2i_rfr_x0: # edm-torch版i2i_rfr相当。ノイズ→targetのフローをx0直接予測で学習する
+    num_steps: 3 # 推論時のオイラー積分ステップ数（元実装は3を常用）
+    num_steps_val: 3 # 検証時のステップ数
+    loss: l1 # l1 or mse
+    p: 1.0 # 時刻tを密度∝t^pでサンプリングし、損失をt^-pで重み付けする
+    t_min: 0.001 # t=0の特異点回避（学習時のtの下限、推論時の速度計算にも使用）
+    time_condition: zero # zero(時刻を与えない・元実装デフォルト) / t / one_minus_t
 
 model:
   name: unet
@@ -107,6 +130,12 @@ model:
     depth: 4
     num_encode_blocks: 2
     num_decode_blocks: 1
+    # スライス方向(z)の畳み込み量の切替（edm-torchのmode相当）
+    # 3d: 全レベル3x3x3畳み込み+2x2x2プーリング（従来動作。crop zは2^depthの倍数）
+    # mixed: 最上位レベルのみ3D、深層は面内(1x3x3)畳み込み+xyのみプーリング
+    #        （zの畳み込み・縮小は最上位の1回だけ。crop zは2の倍数でよい）
+    # 2d: 全レベル面内畳み込み。z方向の畳み込み・縮小なし（スライス独立処理）
+    mode: 3d
   # 通常のbatch normを使う場合はr_maxを1、d_maxを0としてください
   renorm:
     r_max: 3.0 # 1 for batch norm

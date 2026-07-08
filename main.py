@@ -63,7 +63,23 @@ def read_cfg_and_parse_arg():
 
     # その他cfgのチェック
     assert cfg.image.modality in ["CT", "MR"], cfg.image.modality
-    assert cfg.data.mode in ["paired", "paired_dir", "self_noise"], cfg.data.mode
+    # U-Netのmodeに応じてクロップzサイズの割り切れ制約をチェックする
+    unet_mode = cfg.model.unet.get("mode", "3d")
+    assert unet_mode in ["3d", "mixed", "2d"], unet_mode
+    crop_z = int(cfg.aug.crop_size_zyx[0])
+    z_div = {"3d": 2**cfg.model.unet.depth, "mixed": 2, "2d": 1}[unet_mode]
+    assert crop_z % z_div == 0, (
+        f"model.unet.mode={unet_mode}ではcrop_size_zyxのzは{z_div}の倍数にしてください"
+        f"（現在: {crop_z}）"
+    )
+    assert cfg.data.mode in ["paired", "paired_dir", "self_noise", "self_sr"], (
+        cfg.data.mode
+    )
+    if cfg.data.mode == "self_sr":
+        for axis_name in list(cfg.data.self_sr.axes) + [cfg.data.self_sr.val_axis]:
+            assert str(axis_name).upper() in ("AX", "COR", "SAG"), (
+                f"self_sr.axes/val_axisはAX/COR/SAGで指定してください: {axis_name}"
+            )
     if cfg.data.mode == "paired_dir":
         assert cfg.data.target_data_dir, (
             "paired_dirモードではdata.target_data_dirを指定してください"
@@ -96,12 +112,12 @@ def prepare_data_dict(cfg):
     sourceのhdrパスのリストをデータセットごとに列挙する。
     - paired: source xxx.hdr, target xxx{target_suffix}.hdr（同一フォルダ、命名規則）
     - paired_dir: source(data_dir)とtarget(target_data_dir)を別フォルダの同名ファイルで対応
-    - self_noise: クリーン画像のみ（targetファイルは不要。劣化はローダ内で合成）
+    - self_noise / self_sr: クリーン画像のみ（targetファイルは不要。劣化はローダ内で合成）
     targetやマスク類のrawファイルは除外する。
     """
     data_dir = Path(cfg.data_dir)
     target_suffix = cfg.data.target_suffix
-    self_noise = cfg.data.mode == "self_noise"
+    no_target = cfg.data.mode in ("self_noise", "self_sr")
 
     def _collect(split_name):
         data_dict = defaultdict(dict)
@@ -116,7 +132,7 @@ def prepare_data_dict(cfg):
                 if raw_path.stem.endswith(target_suffix) or ".mask" in raw_path.name:
                     continue
                 hdr_path = raw_path.with_suffix(".hdr")
-                if not self_noise:
+                if not no_target:
                     tgt_hdr_path = resolve_target_hdr_path(hdr_path, cfg)
                     assert tgt_hdr_path.exists(), (
                         f"targetが見つかりません: {tgt_hdr_path}"

@@ -8,7 +8,7 @@ import numpy as np
 import tensorflow as tf
 from absl import logging
 from irg import read_hdr, read_raw
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, uniform_filter1d, zoom
 from scipy.signal import fftconvolve
 from tqdm import tqdm
 
@@ -88,6 +88,69 @@ def apply_motion_blur(img: np.ndarray, direction_zyx, length: float) -> np.ndarr
     return out.astype(np.float32, copy=False)
 
 
+# through-plane SRの劣化軸（データはz,y,x順）: AX=z / COR=y / SAG=x
+SR_AXIS_TO_DIM = {"AX": 0, "COR": 1, "SAG": 2}
+
+
+def _resize_axis0(vol: np.ndarray, out_n: int, order: int) -> np.ndarray:
+    """軸0のスライス数をout_nに変える（scipy.zoom。端数はcrop/padで厳密に合わせる）"""
+    out_n = int(out_n)
+    if vol.shape[0] == out_n:
+        return vol.astype(np.float32, copy=False)
+    order = int(order)
+    if order > 1 and vol.shape[0] < 4:
+        order = 1  # スライス数が少なすぎるときはスプラインを使わない
+    out = zoom(vol, (out_n / vol.shape[0], 1.0, 1.0), order=order)
+    if out.shape[0] > out_n:
+        start = (out.shape[0] - out_n) // 2
+        out = out[start : start + out_n]
+    elif out.shape[0] < out_n:
+        pad_before = (out_n - out.shape[0]) // 2
+        pad_after = out_n - out.shape[0] - pad_before
+        out = np.pad(out, ((pad_before, pad_after), (0, 0), (0, 0)), mode="edge")
+    return out.astype(np.float32, copy=False)
+
+
+def simulate_through_plane_sr(
+    img: np.ndarray,
+    axis_dim: int,
+    axis_spacing_mm: float,
+    slice_interval_mm: float,
+    slice_thickness_mm: float,
+    slice_profile: str = "gaussian",
+    interpolation_order: int = 1,
+) -> np.ndarray:
+    """
+    スライス方向の低解像度撮像をシミュレートする（edm-torchの
+    ThroughPlaneSuperResolution physicalモード相当）。
+    1. スライスプロファイルぼかし（gaussian: FWHM=スライス厚 / box: 幅=スライス厚）
+    2. スライス間隔に合わせて間引き
+    3. 元グリッドへ補間で戻す（出力サイズは入力と同じ）
+    """
+    axis_first = np.moveaxis(img.astype(np.float32, copy=False), axis_dim, 0)
+    interval_px = max(float(slice_interval_mm) / float(axis_spacing_mm), 1.0)
+    thickness_px = max(float(slice_thickness_mm) / float(axis_spacing_mm), 1.0)
+
+    if slice_profile == "none" or thickness_px <= 1.0:
+        pass
+    elif slice_profile == "gaussian":
+        sigma = thickness_px / 2.3548  # FWHM -> sigma
+        axis_first = gaussian_filter(axis_first, sigma=(sigma, 0.0, 0.0))
+    elif slice_profile == "box":
+        size = max(1, int(round(thickness_px)))
+        if size > 1:
+            axis_first = uniform_filter1d(axis_first, size=size, axis=0, mode="nearest")
+    else:
+        raise NotImplementedError(slice_profile)
+
+    n_axis = axis_first.shape[0]
+    low_n = int(round((n_axis - 1) / interval_px)) + 1 if n_axis > 1 else 1
+    low_n = max(1, min(n_axis, low_n))
+    lowres = _resize_axis0(axis_first, low_n, interpolation_order)
+    upsampled = _resize_axis0(lowres, n_axis, interpolation_order)
+    return np.moveaxis(upsampled, 0, axis_dim).astype(np.float32, copy=False)
+
+
 def get_clip_vals(img_hdr_path: Path, cfg) -> tuple[float, float]:
     """正規化に使うmin/max値をモダリティに応じて取得する"""
     if cfg.image.modality == "MR":
@@ -153,14 +216,17 @@ def preprocess_image_np(
 
     # self_noiseモード: クリーン画像を1枚だけ読み込み、targetはクリーン、
     #   sourceはクリーン+合成ノイズとする（自己教師デノイジング）
+    # self_srモード: クリーン画像を1枚だけ読み込み、targetはクリーン、
+    #   sourceはスライス方向の低解像度シミュレーション（through-plane SR）
     # pairedモード: source(xxx.hdr)とtarget(xxx.target.hdr)を同一フォルダから読む
     # paired_dirモード: source(data_dir)とtarget(target_data_dir)を別フォルダの同名ファイルから読む
     self_noise = cfg.data.mode == "self_noise"
+    self_sr = cfg.data.mode == "self_sr"
 
     crop_size_zyx = cfg.aug.crop_size_zyx
     img_size_zyx, src_dtype, spacing_zyx = read_hdr(src_hdr_path)
 
-    if not self_noise:
+    if not (self_noise or self_sr):
         tgt_hdr_path = resolve_target_hdr_path(src_hdr_path, cfg)
         tgt_size_zyx, tgt_dtype, tgt_spacing_zyx = read_hdr(tgt_hdr_path)
         # source/targetは位置合わせ済み（同一サイズ・同一スペーシング）が前提
@@ -245,6 +311,37 @@ def preprocess_image_np(
             std_rel = float(cfg_sn.val_noise_std_rel)
             noise = rng.normal(0.0, std_rel * intensity_range, degraded.shape)
         src_img = degraded + noise.astype(np.float32)
+        tgt_min_val, tgt_max_val = src_min_val, src_max_val
+    elif self_sr:
+        # クリーン画像を1回だけアフィン変換し、targetとする
+        clean = affine_transform.apply(src_img, affine_matrix, order=1)
+        tgt_img = clean
+        # sourceはスライス方向の低解像度シミュレーション
+        # アフィン変換後のボクセル間隔はnorm_spacing_zyxになっている
+        cfg_sr = cfg.data.self_sr
+        norm_spacing_zyx = cfg.aug.affine.norm_spacing_zyx
+        interpolation_order = {"linear": 1, "spline": 3}[cfg_sr.slice_interpolation]
+        if is_training:
+            axis_name = str(random.choice(list(cfg_sr.axes))).upper()
+            slice_interval_mm = np.random.uniform(*cfg_sr.slice_interval_mm_range)
+            slice_thickness_mm = np.random.uniform(*cfg_sr.slice_thickness_mm_range)
+        else:
+            # 検証は固定の劣化（軸・間隔・厚みとも決定的で再現可能）
+            axis_name = str(cfg_sr.val_axis).upper()
+            slice_interval_mm = float(cfg_sr.val_slice_interval_mm)
+            slice_thickness_mm = float(cfg_sr.val_slice_thickness_mm)
+        axis_dim = SR_AXIS_TO_DIM[axis_name]
+        if cfg_sr.clamp_thickness_to_interval:
+            slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
+        src_img = simulate_through_plane_sr(
+            clean,
+            axis_dim,
+            float(norm_spacing_zyx[axis_dim]),
+            slice_interval_mm,
+            slice_thickness_mm,
+            slice_profile=cfg_sr.slice_profile,
+            interpolation_order=interpolation_order,
+        )
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     else:
         tgt_img = read_raw(
@@ -436,8 +533,11 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
                 max_percentile=cfg.image.MR.max_percentile,
             )
             _run(func, img_hdr_path_list, "saving source intensity")
-            # self_noiseではtargetはsourceと同一なので別計算は不要
-            if cfg.data.mode != "self_noise" and not cfg.image.share_normalization:
+            # self_noise / self_srではtargetはsourceと同一なので別計算は不要
+            if cfg.data.mode not in (
+                "self_noise",
+                "self_sr",
+            ) and not cfg.image.share_normalization:
                 tgt_hdr_path_list = [
                     resolve_target_hdr_path(Path(p), cfg) for p in img_hdr_path_list
                 ]
