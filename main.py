@@ -12,8 +12,13 @@ from keras.api.optimizers import SGD, AdamW
 from keras.api.optimizers.schedules import CosineDecay
 from omegaconf import ListConfig, OmegaConf
 
-from callbacks import EMACallback, ImageLogger, UnifiedTensorBoardLogger
-from data.dataloader import create_dataloader, resolve_target_hdr_path
+from callbacks import (
+    EMACallback,
+    ImageLogger,
+    TestImageLogger,
+    UnifiedTensorBoardLogger,
+)
+from data.dataloader import create_dataloader, create_test_batch, resolve_target_hdr_path
 from trainers import MODEL_REGISTRY, BaseI2ITrainer, attach_aux_optimizers, build_trainer
 
 
@@ -86,6 +91,11 @@ def read_cfg_and_parse_arg():
         )
         assert Path(cfg.data.target_data_dir).exists(), (
             f"target_data_dirが存在しません: {cfg.data.target_data_dir}"
+        )
+    if cfg.test.enabled:
+        assert cfg.test.input_dir, "test.enabled時はtest.input_dirを指定してください"
+        assert Path(cfg.test.input_dir).exists(), (
+            f"test.input_dirが存在しません: {cfg.test.input_dir}"
         )
     assert cfg.algorithm.name in MODEL_REGISTRY, (
         f"algorithm.name={cfg.algorithm.name} は未実装です。"
@@ -266,8 +276,22 @@ if __name__ == "__main__":
         val_data=next(iter(val_loader)),
         log_dir=tensorboard_dir,
         jit_compile=True,
-        slice_axis=cfg.image.log_axis,
+        slice_axes=cfg.image.log_axis,
     )
+
+    # 正解なしテスト入力への推論を記録するコールバック（test.enabled時のみ）
+    test_logger_callback = None
+    if cfg.test.enabled:
+        test_data, test_names = create_test_batch(cfg)
+        logging.info(f"Test inputs: {test_names}")
+        test_logger_callback = TestImageLogger(
+            test_data=test_data,
+            names=test_names,
+            log_dir=tensorboard_dir,
+            jit_compile=True,
+            slice_axes=cfg.image.log_axis,
+            interval_epochs=cfg.test.interval_epochs,
+        )
 
     # ModelCheckpoint コールバックを設定
     best_checkpoint_callback = ModelCheckpoint(
@@ -310,6 +334,10 @@ if __name__ == "__main__":
         latest_model_callback,
         TerminateOnNaN(),
     ]
+    # テストロガーはEMAより前に置く（on_epoch_end時点ではEMA重みが
+    # スワップインされたままなので、検証と同じEMA重みで推論される）
+    if test_logger_callback is not None:
+        callbacks.append(test_logger_callback)
     # EMAコールバックは検証・チェックポイント保存後に重みを戻す必要があるため、
     # 必ずModelCheckpointより後（末尾）に追加する
     if cfg.ema.enabled:

@@ -590,3 +590,97 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
     dataset = dataset.prefetch(buffer_size=cfg.prefetch_size)
 
     return dataset
+
+
+def preprocess_test_image_np(hdr_path: Path, cfg):
+    """
+    正解なしのテスト入力画像を、検証時と同じ前処理で読み込む。
+    - 画像中心の固定クロップ + norm_spacing_zyxへのリサンプル（線形補間）
+    - 有効領域マスクの生成、正規化用clip値の取得
+    スライス方向に解像度が低い入力（thickスライス等）は、このリサンプルで
+    等方グリッドへ補間されてからモデルに入る。self_srの学習時sourceは
+    「劣化→間引き→元グリッドへ補間」で作られるため、テスト入力もここで
+    同じグリッド・同じ線形補間に揃うことになる。
+    """
+    hdr_path = Path(hdr_path)
+    crop_size_zyx = cfg.aug.crop_size_zyx
+    img_size_zyx, src_dtype, spacing_zyx = read_hdr(hdr_path)
+
+    # 検証時と同じ：画像中心の固定クロップ
+    crop_center_zyx = center_within_image(
+        np.array(img_size_zyx) / 2,
+        img_size_zyx,
+        crop_size_zyx,
+        spacing_zyx,
+        cfg.aug.affine.norm_spacing_zyx,
+    )
+    affine_transform = AffineTransform(crop_size_zyx=crop_size_zyx, **cfg.aug.affine)
+    affine_matrix = affine_transform.get_affine(
+        spacing_zyx, crop_center_zyx, is_training=False
+    )
+    img_region_zyxzyx, shift_start = calc_img_crop_region(
+        crop_size_zyx, affine_matrix, [0, 0, 0], img_size_zyx
+    )
+    affine_matrix = affine_transform.fix_start(affine_matrix, shift_start)
+
+    min_val, max_val = get_clip_vals(hdr_path, cfg)
+
+    src_img = read_raw(
+        hdr_path,
+        clip_zyxzyx=img_region_zyxzyx,
+        img_dtype=src_dtype,
+        size_zyx=img_size_zyx,
+        use_memmap=True,
+    )
+    ones = np.ones(src_img.shape, np.uint8)
+    img_msk = affine_transform.apply(ones, affine_matrix, order=0, cval=0)
+    src_img = affine_transform.apply(src_img, affine_matrix, order=1)
+
+    return (
+        add_channel_dim(src_img.astype(np.float32)),
+        add_channel_dim(img_msk.astype(np.float32)),
+        np.float32(min_val),
+        np.float32(max_val),
+        hdr_path.stem,
+    )
+
+
+def create_test_batch(cfg):
+    """
+    test.input_dirの正解なし入力をまとめて1バッチのdict（predict_step互換）にする。
+    症例数は少ない想定なので学習開始前に一度だけ実行してメモリに保持する。
+    戻り値: (data_dict, 症例名リスト)
+    """
+    test_dir = Path(cfg.test.input_dir)
+    assert test_dir.exists(), f"test.input_dirが存在しません: {test_dir}"
+    hdr_list = [p for p in sorted(test_dir.glob("*.hdr")) if ".mask" not in p.name]
+    if cfg.test.max_items > 0:
+        hdr_list = hdr_list[: cfg.test.max_items]
+    assert len(hdr_list) > 0, f"テスト入力(.hdr)が見つかりません: {test_dir}"
+
+    # MRは正規化用のintensityファイルを事前計算しておく（学習データと同じ処理）
+    if cfg.image.modality == "MR":
+        for hdr_path in hdr_list:
+            save_intensity(
+                str(hdr_path),
+                min_percentile=cfg.image.MR.min_percentile,
+                max_percentile=cfg.image.MR.max_percentile,
+            )
+
+    srcs, msks, min_vals, max_vals, names = [], [], [], [], []
+    for hdr_path in hdr_list:
+        src, msk, min_val, max_val, name = preprocess_test_image_np(hdr_path, cfg)
+        srcs.append(src)
+        msks.append(msk)
+        min_vals.append(min_val)
+        max_vals.append(max_val)
+        names.append(name)
+        logging.info(f"Test input loaded: {name} (clip=[{min_val:.1f}, {max_val:.1f}])")
+
+    data = dict(
+        src_imgs=tf.constant(np.stack(srcs), tf.float32),
+        img_msks=tf.constant(np.stack(msks), tf.float32),
+        src_min_clip_vals=tf.constant(np.stack(min_vals), tf.float32),
+        src_max_clip_vals=tf.constant(np.stack(max_vals), tf.float32),
+    )
+    return data, names

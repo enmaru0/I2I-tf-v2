@@ -204,7 +204,9 @@ aug:
 
 image:
   modality: CT # CT or MR　画像の正規化方法を変えます
-  log_axis: y # TensorBoardの画像ロギング断面 z/y/x（データはz,y,x順）
+  # TensorBoardの画像ロギング断面。z/y/xを複数指定できる（データはz,y,x順）
+  # 例: [y] / [z, y] / [z, y, x]。文字列1つ（log_axis: y）でも動く
+  log_axis: [y]
   # Trueの場合、targetの正規化にsourceと同じmin/maxを使う
   # デノイズ・ぼかし修正のような同一モダリティ変換ではTrueを推奨
   share_normalization: True
@@ -214,3 +216,14 @@ image:
   MR:
     min_percentile: 5 # %
     max_percentile: 95 # %
+
+# 正解なしテスト入力の推論ログ（学習中にTensorBoardへ記録する）
+# 入力は検証時と同じ前処理（中心クロップ + norm_spacing_zyxへの補間リサンプル）
+# を通るため、スライス方向に解像度が低い実データ（self_srのテスト等）は
+# ここで等方グリッドへ補間されてからモデルに入る
+test:
+  enabled: False
+  input_dir: "" # 正解なしの入力画像(.hdr/.raw)を置いたフォルダ
+  max_items: 4 # 記録する最大症例数（0以下で全件。名前順の先頭から使う）
+  interval_epochs: 1 # 何エポック（eval_everyステップ）ごとに記録するか
+  # 断面はimage.log_axisと共通

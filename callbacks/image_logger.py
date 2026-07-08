@@ -17,13 +17,24 @@ def _take_slice(vol, axis: str):
         raise ValueError(f"Invalid slice axis: {axis} (use z/y/x)")
 
 
+def as_axis_list(slice_axes) -> list[str]:
+    """log_axis設定を断面リストに正規化する（文字列1つでもリストでも受ける）"""
+    if isinstance(slice_axes, str):
+        axes = [slice_axes]
+    else:
+        axes = [str(a) for a in slice_axes]
+    for axis in axes:
+        assert axis in ("z", "y", "x"), f"log_axisはz/y/xで指定してください: {axis}"
+    return axes
+
+
 class ImageLogger(keras.callbacks.Callback):
-    def __init__(self, val_data, log_dir, jit_compile, slice_axis: str = "z"):
+    def __init__(self, val_data, log_dir, jit_compile, slice_axes="z"):
         super().__init__()
         self.writer = tf.summary.create_file_writer(str(log_dir))
         self.val_data = val_data
         self.first_log = True
-        self.slice_axis = slice_axis
+        self.slice_axes = as_axis_list(slice_axes)
 
         def predict_step(data):
             return self.model.predict_step(data, return_aux=True)
@@ -42,24 +53,26 @@ class ImageLogger(keras.callbacks.Callback):
             return
 
         _, preds, src_imgs, tgt_imgs, _ = self.one_step(self.val_data)
-        axis = self.slice_axis
 
         with self.writer.as_default():
             step = self.model.optimizer.iterations
-            if self.first_log:
-                # sourceとtargetは学習中変わらないので初回のみ記録する
+            for axis in self.slice_axes:
+                if self.first_log:
+                    # sourceとtargetは学習中変わらないので初回のみ記録する
+                    tf.summary.image(
+                        f"Source Images/{axis}", _take_slice(src_imgs, axis), step=step
+                    )
+                    tf.summary.image(
+                        f"Target Images/{axis}", _take_slice(tgt_imgs, axis), step=step
+                    )
                 tf.summary.image(
-                    "Source Images", _take_slice(src_imgs, axis), step=step
+                    f"Predicted Images/{axis}", _take_slice(preds, axis), step=step
                 )
                 tf.summary.image(
-                    "Target Images", _take_slice(tgt_imgs, axis), step=step
+                    f"Absolute Error/{axis}",
+                    _take_slice(tf.abs(preds - tgt_imgs), axis),
+                    step=step,
                 )
-                self.first_log = False
-            tf.summary.image("Predicted Images", _take_slice(preds, axis), step=step)
-            tf.summary.image(
-                "Absolute Error",
-                _take_slice(tf.abs(preds - tgt_imgs), axis),
-                step=step,
-            )
+            self.first_log = False
 
         self.writer.flush()
