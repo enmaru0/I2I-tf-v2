@@ -78,13 +78,26 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
         return loss, x1_hat
 
     def _sample(self, src_x, img_msks, num_steps: int):
-        """オイラー積分によるサンプリング（ネットワーク評価はnum_steps回）"""
+        """
+        t=0からt=1への数値積分によるサンプリング。
+        solver=euler: 1次オイラー（ネットワーク評価はnum_steps回）
+        solver=heun: 2次Heun（ネットワーク評価は2*num_steps回）
+        """
+        # 古いoutput.yamlにはsolverが無いためデフォルト(従来動作のeuler)を使う
+        solver = self._cfg_rf().get("solver", "euler")
+        assert solver in ("euler", "heun"), solver
         dt = 1.0 / num_steps
         x = self._initial_state(src_x)
         for i in range(num_steps):
             t = ops.ones_like(x[:, :1, :1, :1, :1]) * (i * dt)
             v = self._velocity(x, t, src_x, img_msks, training=False)
-            x = x + dt * v
+            x_next = x + dt * v
+            if solver == "heun":
+                # 2次補正: 仮ステップ先の速度と平均する
+                t2 = ops.ones_like(x[:, :1, :1, :1, :1]) * ((i + 1) * dt)
+                v2 = self._velocity(x_next, t2, src_x, img_msks, training=False)
+                x_next = x + dt * 0.5 * (v + v2)
+            x = x_next
         return x
 
     def train_step(self, data):

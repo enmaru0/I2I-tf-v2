@@ -86,8 +86,15 @@ class I2IRFRX0Trainer(RectifiedFlowTrainer):
         return loss, x0_pred
 
     def _sample(self, src_x, img_msks, num_steps: int):
-        """t=1の純ノイズからのオイラー積分（ネットワーク評価はnum_steps回）"""
+        """
+        t=1の純ノイズからt=0への数値積分。速度は v = (x_t - x0_pred) / t。
+        solver=euler: 1次オイラー（ネットワーク評価はnum_steps回）
+        solver=heun: 2次Heun（最終ステップのみオイラー。評価は2*num_steps-1回）
+        """
         cfg = self._cfg_rf()
+        # 古いoutput.yamlにはsolverが無いためデフォルト(従来動作のeuler)を使う
+        solver = cfg.get("solver", "euler")
+        assert solver in ("euler", "heun"), solver
         dt = 1.0 / num_steps
         x = tf.random.normal(tf.shape(src_x))
         for n in range(num_steps):
@@ -95,5 +102,14 @@ class I2IRFRX0Trainer(RectifiedFlowTrainer):
             t = ops.ones_like(x[:, :1, :1, :1, :1]) * t_val
             x0_pred = self._predict_x0(x, t, src_x, img_msks, training=False)
             v = (x - x0_pred) / t_val
-            x = x - dt * v
+            x_next = x - dt * v
+            t_next_val = 1.0 - (n + 1) / num_steps
+            if solver == "heun" and t_next_val > 0:
+                # 2次補正: 仮ステップ先の速度と平均する（t=0は特異なので最終ステップは1次）
+                t_next_val = max(t_next_val, cfg.t_min)
+                t2 = ops.ones_like(x[:, :1, :1, :1, :1]) * t_next_val
+                x0_pred2 = self._predict_x0(x_next, t2, src_x, img_msks, training=False)
+                v2 = (x_next - x0_pred2) / t_next_val
+                x_next = x - dt * 0.5 * (v + v2)
+            x = x_next
         return x

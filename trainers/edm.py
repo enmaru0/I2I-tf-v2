@@ -65,12 +65,16 @@ class EDMTrainer(BaseI2ITrainer):
 
     def _sample(self, src_x, img_msks, num_steps: int):
         """
-        Karrasスケジュール + 2次Heunソルバーによる決定的サンプリング。
-        ネットワーク評価回数は 2*num_steps - 1 回。
+        Karrasスケジュールによる決定的サンプリング。
+        solver=heun: 2次Heun（ネットワーク評価は 2*num_steps - 1 回）
+        solver=euler: 1次オイラー（ネットワーク評価は num_steps 回）
         """
         cfg_edm = self._cfg_edm()
         rho = cfg_edm.rho
         s_min, s_max = cfg_edm.sigma_min, cfg_edm.sigma_max
+        # 古いoutput.yamlにはsolverが無いためデフォルト(従来動作のheun)を使う
+        solver = cfg_edm.get("solver", "heun")
+        assert solver in ("euler", "heun"), solver
 
         # σスケジュールはPython floatの定数としてグラフに埋め込む
         sigmas = [
@@ -88,7 +92,7 @@ class EDMTrainer(BaseI2ITrainer):
             sigma_t = ops.ones_like(x[:, :1, :1, :1, :1]) * s_cur
             d = (x - self._denoise(x, sigma_t, src_x, img_msks, False)) / s_cur
             x_next = x + (s_next - s_cur) * d
-            if s_next > 0:
+            if s_next > 0 and solver == "heun":
                 # 2次補正（Heun）
                 sigma_t2 = ops.ones_like(x[:, :1, :1, :1, :1]) * s_next
                 d2 = (

@@ -99,28 +99,32 @@ algorithm:
     sigma_min: 0.002
     sigma_max: 80.0
     rho: 7.0 # Karrasスケジュールの歪み係数
-    num_steps: 20 # 推論時のサンプリングステップ数(ネットワーク評価は2N-1回)
+    num_steps: 20 # 推論時のサンプリングステップ数(ネットワーク評価はheun:2N-1回 / euler:N回)
     num_steps_val: 8 # 検証時のステップ数（val_psnr計算用。小さめにして高速化）
+    solver: heun # heun(2次・推奨) or euler(1次・評価回数半分)
   rectified_flow: # optimizerはadamw(max_lr 1e-4～2e-4)を推奨
-    num_steps: 20 # 推論時のオイラー積分ステップ数(ネットワーク評価はN回)
+    num_steps: 20 # 推論時の積分ステップ数(ネットワーク評価はeuler:N回 / heun:2N回)
     num_steps_val: 8 # 検証時のステップ数（val_psnr計算用）
     time_sampling: uniform # uniform or logit_normal(中間時刻を重視。SD3方式)
     logit_normal_mean: 0.0
     logit_normal_std: 1.0
+    solver: euler # euler(1次) or heun(2次・同じ精度を少ないステップ数で狙える)
   i2i_rfr: # source→targetを直接結ぶrectified flow。少ステップで動くのが利点
-    num_steps: 4 # 推論時のオイラー積分ステップ数（1でも可）
+    num_steps: 4 # 推論時の積分ステップ数（1でも可）
     num_steps_val: 2 # 検証時のステップ数
     noise_std: 0.1 # 出発点x0=source+noise_std*εのノイズ量([-1,1]基準。0で決定的)
     time_sampling: uniform
     logit_normal_mean: 0.0
     logit_normal_std: 1.0
+    solver: euler # euler(1次) or heun(2次)
   i2i_rfr_x0: # edm-torch版i2i_rfr相当。ノイズ→targetのフローをx0直接予測で学習する
-    num_steps: 3 # 推論時のオイラー積分ステップ数（元実装は3を常用）
+    num_steps: 3 # 推論時の積分ステップ数（元実装は3を常用）
     num_steps_val: 3 # 検証時のステップ数
     loss: l1 # l1 or mse
     p: 1.0 # 時刻tを密度∝t^pでサンプリングし、損失をt^-pで重み付けする
     t_min: 0.001 # t=0の特異点回避（学習時のtの下限、推論時の速度計算にも使用）
     time_condition: zero # zero(時刻を与えない・元実装デフォルト) / t / one_minus_t
+    solver: euler # euler(1次・元実装と同じ) or heun(2次・最終ステップのみ1次)
 
 model:
   name: unet
