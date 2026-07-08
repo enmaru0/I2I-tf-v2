@@ -1,0 +1,183 @@
+# 実験するたびにここを変更しない。基本はスクリプトから変更する。
+# python main.py --overrides exp_dir=results/test2 model.unet.start_ch=32
+# 上記のように--overridesの後に変更したい変数を書くことで設定を変更できる
+exp_dir: results/test
+
+data_dir: datasets_i2i
+num_train_steps: 100000
+eval_every: 1000
+num_workers: 12
+batch_size: 16
+prefetch_size: 2
+
+debug_time: False
+debug_train_val: False
+debug_dataloader: False # debug_dataloader.pyで設定されるので触る必要はない
+gpu: 0
+gpu_allow_growth: False
+enable_profiling: False
+
+restore: "" # 実験を再開する場合はここにチェックポイントのパスを指定
+finetune: "" # 事前学習済みモデルを指定する場合はここにパスを指定
+
+# generatorの重みの指数移動平均。拡散/フロー系(edm/rectified_flow/i2i_rfr)で特に有効。
+# 有効時は検証・チェックポイントがEMA重みになる（restoreの厳密再開は不可になる）
+ema:
+  enabled: False
+  decay: 0.999
+
+data:
+  # paired: source(xxx.hdr) と target(xxx.target.hdr) を同一フォルダから読む
+  # paired_dir: source(data_dir) と target(target_data_dir) を別フォルダの同名ファイルで対応
+  # self_noise: クリーン画像1枚から source=クリーン+合成ノイズ / target=クリーン を作る
+  #             （ペア画像が無い自己教師デノイジング。targetファイル不要）
+  mode: paired
+  # pairedモード: sourceが xxx.hdr のとき target は xxx.target.hdr
+  target_suffix: ".target"
+  # paired_dirモード: targetのルートフォルダ（data_dir配下と同じ {split}/{dataset}/{同名} 構造）
+  target_data_dir: ""
+  self_noise:
+    # 劣化はぼかし→ノイズの順に適用する
+    # ノイズ量は強度レンジ(正規化のmin-max)に対する相対値で指定する
+    noise_std_rel_range: [0.05, 0.15] # 学習時はこの範囲でランダム
+    val_noise_std_rel: 0.1 # 検証時は固定（ファイル名でシード固定し再現性を確保）
+    # ぼかし（ガウシアン、sigmaはvoxel単位）。blur_prob=0で無効
+    blur_prob: 0.0 # 学習時にぼかしを適用する確率
+    blur_sigma_range: [0.5, 1.5] # 学習時のsigma範囲
+    val_blur_sigma: 0.0 # 検証時の固定sigma（0でぼかし無し）
+    # 手ブレ様のモーションブラー（ランダム3D方向の直線PSF、長さはvoxel単位）
+    # 方向の曖昧さにより正解候補が多峰的になる（生成系との比較実験向き）
+    motion_blur:
+      prob: 0.0 # 学習時に適用する確率。0で無効
+      length_range: [3.0, 9.0] # 学習時のブレ長さ範囲
+      val_length: 0.0 # 検証時の固定長さ（0で無効。方向はファイル毎にシード固定）
+
+# 画像変換アルゴリズムの選択と設定
+# 比較実験は --overrides algorithm.name=pix2pix exp_dir=results/pix2pix のように行う
+algorithm:
+  name: regression # regression / pix2pix / edm / rectified_flow / i2i_rfr
+  regression:
+    # residual: pred = source + logits (デノイズ・ぼかし修正におすすめ)
+    # direct: pred = sigmoid(logits)
+    output_mode: residual
+    loss:
+      l1: 1.0 # 0.0で無効化
+      l2: 0.0 # 0.0で無効化
+      ssim: 0.0 # 0.0で無効化 (1 - SSIMを損失として加える)
+  pix2pix:
+    output_mode: residual # regressionと同じ意味
+    gan_mode: lsgan # lsgan(推奨) or vanilla
+    l1_weight: 100.0 # pix2pix論文のデフォルト
+    gan_weight: 1.0
+    discriminator:
+      base_ch: 16
+      num_layers: 3 # ストライド2の畳み込みの数（受容野の大きさが変わる）
+    d_optimizer: # discriminator用（generatorはoptimizerセクションの設定を使う）
+      lr: 2e-4
+      beta_1: 0.5
+      clip_value: 10
+  edm: # optimizerはadamw(max_lr 1e-4～2e-4)を推奨
+    sigma_data: 0.5 # 画像を[-1,1]で扱うので0.5固定を推奨
+    P_mean: -1.2 # 学習時のσサンプリング(log-normal)の平均
+    P_std: 1.2 # 同標準偏差
+    sigma_min: 0.002
+    sigma_max: 80.0
+    rho: 7.0 # Karrasスケジュールの歪み係数
+    num_steps: 20 # 推論時のサンプリングステップ数(ネットワーク評価は2N-1回)
+    num_steps_val: 8 # 検証時のステップ数（val_psnr計算用。小さめにして高速化）
+  rectified_flow: # optimizerはadamw(max_lr 1e-4～2e-4)を推奨
+    num_steps: 20 # 推論時のオイラー積分ステップ数(ネットワーク評価はN回)
+    num_steps_val: 8 # 検証時のステップ数（val_psnr計算用）
+    time_sampling: uniform # uniform or logit_normal(中間時刻を重視。SD3方式)
+    logit_normal_mean: 0.0
+    logit_normal_std: 1.0
+  i2i_rfr: # source→targetを直接結ぶrectified flow。少ステップで動くのが利点
+    num_steps: 4 # 推論時のオイラー積分ステップ数（1でも可）
+    num_steps_val: 2 # 検証時のステップ数
+    noise_std: 0.1 # 出発点x0=source+noise_std*εのノイズ量([-1,1]基準。0で決定的)
+    time_sampling: uniform
+    logit_normal_mean: 0.0
+    logit_normal_std: 1.0
+
+model:
+  name: unet
+  num_channel: 1 # グレースケール出力なので1固定
+  unet:
+    start_ch: 8
+    depth: 4
+    num_encode_blocks: 2
+    num_decode_blocks: 1
+  # 通常のbatch normを使う場合はr_maxを1、d_maxを0としてください
+  renorm:
+    r_max: 3.0 # 1 for batch norm
+    d_max: 5.0 # 0 for batch norm
+    warmup_steps: 5000
+    change_d_steps: 25000
+    change_r_steps: 40000
+
+optimizer:
+  name: sgd
+  sgd:
+    warmup_lr: 1e-4
+    max_lr: 0.1
+    warmup_ratio: 0.3
+    wd: 1e-6
+    momentum: 0.9
+    use_nesterov: True
+    clip_value: 10
+  adamw:
+    warmup_lr: 1e-5
+    max_lr: 1e-3
+    warmup_ratio: 0.3
+    wd: 1e-4
+    clip_value: 10
+
+aug:
+  crop_size_zyx: [128,128,128]
+  thick2thin_rate_zyx: [0.0,0.0,0.0] # sourceのみ疑似thick化する。I2Iではデフォルト無効
+
+  affine:
+    norm_spacing_zyx: [1.0,1.0,1.0]
+    random_rot_deg_zyx: [180,180,180] # +-180度の範囲で回転
+    random_flip_axis_zyx: [False,False,True] #x=左右反転
+    random_scaling_range_zyx: [[0.15,0.15],[0.15,0.15],[0.15, 0.15]]
+    random_shift_rate_zyx: [0.,0.,0.] # 回転中心をランダムに選ぶのでここは０にした
+
+  # 以下の強度系のデータ拡張はsourceのみに適用される（targetは常に決定的に正規化）
+  # デノイズ・ぼかし修正では劣化過程そのものを変えてしまうため、デフォルトは無効
+  random_sharpness:
+    prob: 0.0
+    sigma: 3.0
+    alpha_range: [0.,2.]
+  random_gauss_filter:
+    prob: 0.0
+    sigma_range: [0.5,2.0]
+  random_gauss_noise:
+    prob: 0.0
+    stddev_range: [0.0,0.05]
+  random_normalize:
+    prob: 0.0 # sourceとtargetの正規化が食い違うので基本は無効を推奨
+    random_center_deviation: 0.5
+    random_range_deviation: 0.1
+  random_gamma_correction:
+    prob: 0.0
+    random_gamma_range: [1.0,1.0] # 1.0-1.0で無効化
+
+  # ランダムクロップの中心を決める方法（検証時は画像中心を使う）
+  # body: 体表マスク(.body.mask.hdr)の矩形内でクロップ / image: 画像全体からクロップ
+  random_crop_method:
+    body: 0.0
+    image: 1.0
+
+image:
+  modality: CT # CT or MR　画像の正規化方法を変えます
+  log_axis: y # TensorBoardの画像ロギング断面 z/y/x（データはz,y,x順）
+  # Trueの場合、targetの正規化にsourceと同じmin/maxを使う
+  # デノイズ・ぼかし修正のような同一モダリティ変換ではTrueを推奨
+  share_normalization: True
+  CT:
+    window_level: 60 # HU
+    window_width: 600 # HU
+  MR:
+    min_percentile: 5 # %
+    max_percentile: 95 # %

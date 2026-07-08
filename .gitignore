@@ -1,0 +1,40 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.tb_venv/
+
+# Local editor/assistant state
+.claude/
+
+# Training outputs and logs
+results/
+runs/
+logs/
+checkpoints/
+*.keras
+*.h5
+*.ckpt
+events.out.tfevents.*
+
+# Local datasets / generated arrays
+data_dir/
+datasets/
+noisy_root/
+clean_root/
+*.npy
+*.npz
+*.nii
+*.nii.gz
+*.hdr
+*.img
+*.raw
