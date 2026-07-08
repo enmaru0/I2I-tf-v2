@@ -151,6 +151,47 @@ def simulate_through_plane_sr(
     return np.moveaxis(upsampled, 0, axis_dim).astype(np.float32, copy=False)
 
 
+def apply_random_self_noise(clean: np.ndarray, intensity_range: float, cfg_sn) -> np.ndarray:
+    """
+    self_noiseの学習時ランダム劣化（モーションブラー→ぼかし→ノイズの順）。
+    学習ローダとprobe_sim2real.pyの両方から使う。
+    """
+    degraded = clean.astype(np.float32)
+    if np.random.uniform() < cfg_sn.motion_blur.prob:
+        length = np.random.uniform(*cfg_sn.motion_blur.length_range)
+        direction = np.random.normal(size=3)  # 一様ランダム方向
+        degraded = apply_motion_blur(degraded, direction, length)
+    if np.random.uniform() < cfg_sn.blur_prob:
+        sigma = np.random.uniform(*cfg_sn.blur_sigma_range)
+        degraded = gaussian_filter(degraded, sigma=sigma)
+    std_rel = np.random.uniform(*cfg_sn.noise_std_rel_range)
+    noise = np.random.normal(0.0, std_rel * intensity_range, degraded.shape)
+    return degraded + noise.astype(np.float32)
+
+
+def apply_random_self_sr(clean: np.ndarray, norm_spacing_zyx, cfg_sr) -> np.ndarray:
+    """
+    self_srの学習時ランダム劣化（軸・スライス間隔・厚みをサンプリング）。
+    学習ローダとprobe_sim2real.pyの両方から使う。
+    """
+    interpolation_order = {"linear": 1, "spline": 3}[cfg_sr.slice_interpolation]
+    axis_name = str(random.choice(list(cfg_sr.axes))).upper()
+    axis_dim = SR_AXIS_TO_DIM[axis_name]
+    slice_interval_mm = np.random.uniform(*cfg_sr.slice_interval_mm_range)
+    slice_thickness_mm = np.random.uniform(*cfg_sr.slice_thickness_mm_range)
+    if cfg_sr.clamp_thickness_to_interval:
+        slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
+    return simulate_through_plane_sr(
+        clean,
+        axis_dim,
+        float(norm_spacing_zyx[axis_dim]),
+        slice_interval_mm,
+        slice_thickness_mm,
+        slice_profile=cfg_sr.slice_profile,
+        interpolation_order=interpolation_order,
+    )
+
+
 def get_clip_vals(img_hdr_path: Path, cfg) -> tuple[float, float]:
     """正規化に使うmin/max値をモダリティに応じて取得する"""
     if cfg.image.modality == "MR":
@@ -283,19 +324,11 @@ def preprocess_image_np(
         # ノイズ量は強度レンジ(正規化min-max)に対する相対量で指定する
         cfg_sn = cfg.data.self_noise
         intensity_range = float(src_max_val - src_min_val)
-        degraded = clean.astype(np.float32)
         if is_training:
-            # 学習時は劣化をランダムに適用
-            if np.random.uniform() < cfg_sn.motion_blur.prob:
-                length = np.random.uniform(*cfg_sn.motion_blur.length_range)
-                direction = np.random.normal(size=3)  # 一様ランダム方向
-                degraded = apply_motion_blur(degraded, direction, length)
-            if np.random.uniform() < cfg_sn.blur_prob:
-                sigma = np.random.uniform(*cfg_sn.blur_sigma_range)
-                degraded = gaussian_filter(degraded, sigma=sigma)
-            std_rel = np.random.uniform(*cfg_sn.noise_std_rel_range)
-            noise = np.random.normal(0.0, std_rel * intensity_range, degraded.shape)
+            # 学習時は劣化をランダムに適用（probe_sim2real.pyと共通の関数）
+            src_img = apply_random_self_noise(clean, intensity_range, cfg_sn)
         else:
+            degraded = clean.astype(np.float32)
             # 検証はエポック間・実行間で再現するようファイル名でシードを固定する
             # （組み込みhashはプロセス毎に変わるためcrc32を使う）
             seed = zlib.crc32(src_hdr_path.stem.encode())
@@ -310,7 +343,7 @@ def preprocess_image_np(
                 degraded = gaussian_filter(degraded, sigma=float(cfg_sn.val_blur_sigma))
             std_rel = float(cfg_sn.val_noise_std_rel)
             noise = rng.normal(0.0, std_rel * intensity_range, degraded.shape)
-        src_img = degraded + noise.astype(np.float32)
+            src_img = degraded + noise.astype(np.float32)
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     elif self_sr:
         # クリーン画像を1回だけアフィン変換し、targetとする
@@ -320,28 +353,27 @@ def preprocess_image_np(
         # アフィン変換後のボクセル間隔はnorm_spacing_zyxになっている
         cfg_sr = cfg.data.self_sr
         norm_spacing_zyx = cfg.aug.affine.norm_spacing_zyx
-        interpolation_order = {"linear": 1, "spline": 3}[cfg_sr.slice_interpolation]
         if is_training:
-            axis_name = str(random.choice(list(cfg_sr.axes))).upper()
-            slice_interval_mm = np.random.uniform(*cfg_sr.slice_interval_mm_range)
-            slice_thickness_mm = np.random.uniform(*cfg_sr.slice_thickness_mm_range)
+            # 学習時は劣化をランダムに適用（probe_sim2real.pyと共通の関数）
+            src_img = apply_random_self_sr(clean, norm_spacing_zyx, cfg_sr)
         else:
             # 検証は固定の劣化（軸・間隔・厚みとも決定的で再現可能）
-            axis_name = str(cfg_sr.val_axis).upper()
+            axis_dim = SR_AXIS_TO_DIM[str(cfg_sr.val_axis).upper()]
             slice_interval_mm = float(cfg_sr.val_slice_interval_mm)
             slice_thickness_mm = float(cfg_sr.val_slice_thickness_mm)
-        axis_dim = SR_AXIS_TO_DIM[axis_name]
-        if cfg_sr.clamp_thickness_to_interval:
-            slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
-        src_img = simulate_through_plane_sr(
-            clean,
-            axis_dim,
-            float(norm_spacing_zyx[axis_dim]),
-            slice_interval_mm,
-            slice_thickness_mm,
-            slice_profile=cfg_sr.slice_profile,
-            interpolation_order=interpolation_order,
-        )
+            if cfg_sr.clamp_thickness_to_interval:
+                slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
+            src_img = simulate_through_plane_sr(
+                clean,
+                axis_dim,
+                float(norm_spacing_zyx[axis_dim]),
+                slice_interval_mm,
+                slice_thickness_mm,
+                slice_profile=cfg_sr.slice_profile,
+                interpolation_order={"linear": 1, "spline": 3}[
+                    cfg_sr.slice_interpolation
+                ],
+            )
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     else:
         tgt_img = read_raw(
