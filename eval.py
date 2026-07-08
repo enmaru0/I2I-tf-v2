@@ -13,7 +13,7 @@ from main import gpu_setting, prepare_data_dict
 from trainers import attach_aux_optimizers
 
 # サンプリングステップ数(num_steps)を持つ生成系アルゴリズム
-GENERATIVE = {"edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0"}
+GENERATIVE = {"edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0", "resshift", "split_mean_flow"}
 
 
 def evaluate_once(model, val_loader, max_batches: int, seed: int):

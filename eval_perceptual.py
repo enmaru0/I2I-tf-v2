@@ -25,7 +25,7 @@ from losses import masked_psnr, ssim
 from main import gpu_setting, prepare_data_dict
 from trainers import attach_aux_optimizers
 
-GENERATIVE = {"edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0"}
+GENERATIVE = {"edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0", "resshift", "split_mean_flow"}
 
 
 def sharpness(vol_zyx, msk_zyx):

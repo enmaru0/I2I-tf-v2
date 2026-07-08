@@ -71,7 +71,7 @@ data:
 # 画像変換アルゴリズムの選択と設定
 # 比較実験は --overrides algorithm.name=pix2pix exp_dir=results/pix2pix のように行う
 algorithm:
-  name: regression # regression / pix2pix / edm / rectified_flow / i2i_rfr / i2i_rfr_x0
+  name: regression # regression / pix2pix / edm / rectified_flow / i2i_rfr / i2i_rfr_x0 / resshift / split_mean_flow
   regression:
     # residual: pred = source + logits (デノイズ・ぼかし修正におすすめ)
     # direct: pred = sigmoid(logits)
@@ -125,6 +125,22 @@ algorithm:
     t_min: 0.001 # t=0の特異点回避（学習時のtの下限、推論時の速度計算にも使用）
     time_condition: zero # zero(時刻を与えない・元実装デフォルト) / t / one_minus_t
     solver: euler # euler(1次・元実装と同じ) or heun(2次・最終ステップのみ1次)
+  resshift: # ResShift (Yue et al. 2023): source-target残差をシフトする少ステップ拡散
+    num_steps: 15 # ηスケジュール長T（学習・推論共通。論文は15）
+    num_steps_val: 15 # 検証時のチェーンステップ数
+    kappa: 2.0 # 前向き過程のノイズ強度κ（[-1,1]の作業空間基準）
+    schedule_p: 0.3 # sqrt(η)の幾何級数スケジュールの成長率
+    loss: mse # mse or l1
+    # eta(連続値・推奨) / sqrt_eta / t(インデックス基準。ステップ数変更と相性が悪い)
+    time_condition: eta
+    sample_noise: false # trueで確率的サンプリング。メトリクス評価はfalse(決定的)を推奨
+  split_mean_flow: # SplitMeanFlow: 平均速度場u(x_t,t,s)をJVPなしで学習する1〜数ステップ生成
+    num_steps: 1 # 推論時のジャンプ回数（1ステップ生成が主目的。増やすことも可）
+    num_steps_val: 1 # 検証時のステップ数
+    # 境界条件(s=t、通常のflow matching)として学習するサンプルの割合。
+    # 残りは区間分割整合性で学習する。学習初期はflow matchingが支配的な方が
+    # 安定するため、収束が悪い場合は大きめ(0.75など)から試す
+    fm_ratio: 0.5
 
 model:
   name: unet
