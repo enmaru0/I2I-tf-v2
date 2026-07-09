@@ -90,6 +90,11 @@ def read_cfg_and_parse_arg():
             "data.self_sr.slice_profileはgaussian/box/continuous/noneで"
             f"指定してください（現在: {cfg.data.self_sr.slice_profile}）"
         )
+        if sr_profile == "continuous":
+            assert float(cfg.data.self_sr.continuous_sigma_k) >= 0.0, (
+                "data.self_sr.continuous_sigma_kは0以上で指定してください"
+                f"（現在: {cfg.data.self_sr.continuous_sigma_k}）"
+            )
         sr_interp = str(cfg.data.self_sr.slice_interpolation).lower().replace("_", "-")
         assert sr_interp in (
             "linear",
@@ -102,6 +107,12 @@ def read_cfg_and_parse_arg():
             "data.self_sr.slice_interpolationはlinear/spline/b-splineで"
             f"指定してください（現在: {cfg.data.self_sr.slice_interpolation}）"
         )
+        if sr_interp in ("b-spline", "bspline", "b-spine", "bspine"):
+            b_spline_order = int(cfg.data.self_sr.b_spline_order)
+            assert 0 <= b_spline_order <= 5, (
+                "data.self_sr.b_spline_orderは0〜5で指定してください"
+                f"（現在: {cfg.data.self_sr.b_spline_order}）"
+            )
     if cfg.data.mode == "paired_dir":
         assert cfg.data.target_data_dir, (
             "paired_dirモードではdata.target_data_dirを指定してください"

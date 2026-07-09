@@ -93,7 +93,9 @@ SR_AXIS_TO_DIM = {"AX": 0, "COR": 1, "SAG": 2}
 CONTINUOUS_SR_SIGMA_FACTOR = 0.32
 
 
-def _normalize_sr_interpolation(slice_interpolation: str) -> tuple[int, bool]:
+def _normalize_sr_interpolation(
+    slice_interpolation: str, b_spline_order: int = 3
+) -> tuple[int, bool]:
     """self_srの補間設定をscipy.zoomのorder/prefilterへ変換する。"""
     method = str(slice_interpolation).lower().replace("_", "-")
     if method == "linear":
@@ -101,7 +103,7 @@ def _normalize_sr_interpolation(slice_interpolation: str) -> tuple[int, bool]:
     if method == "spline":
         return 3, True
     if method in ("b-spline", "bspline", "b-spine", "bspine"):
-        return 3, False
+        return int(b_spline_order), False
     raise NotImplementedError(slice_interpolation)
 
 
@@ -140,6 +142,7 @@ def simulate_through_plane_sr(
     slice_profile: str = "gaussian",
     interpolation_order: int = 1,
     interpolation_prefilter: bool = True,
+    continuous_sigma_k: float = CONTINUOUS_SR_SIGMA_FACTOR,
 ) -> np.ndarray:
     """
     スライス方向の低解像度撮像をシミュレートする（edm-torchの
@@ -147,7 +150,7 @@ def simulate_through_plane_sr(
     1. スライスプロファイルぼかし
        - gaussian: FWHM=スライス厚
        - box: 幅=スライス厚
-       - continuous: sigma=スライス間隔*0.32
+       - continuous: sigma=スライス間隔*k
     2. スライス間隔に合わせて間引き
     3. 元グリッドへ補間で戻す（出力サイズは入力と同じ）
     """
@@ -170,7 +173,7 @@ def simulate_through_plane_sr(
         if size > 1:
             axis_first = uniform_filter1d(axis_first, size=size, axis=0, mode="nearest")
     elif slice_profile == "continuous":
-        sigma = interval_px * CONTINUOUS_SR_SIGMA_FACTOR
+        sigma = interval_px * float(continuous_sigma_k)
         axis_first = gaussian_filter(axis_first, sigma=(sigma, 0.0, 0.0))
     else:
         raise NotImplementedError(slice_profile)
@@ -211,7 +214,8 @@ def apply_random_self_sr(clean: np.ndarray, norm_spacing_zyx, cfg_sr) -> np.ndar
     学習ローダとprobe_sim2real.pyの両方から使う。
     """
     interpolation_order, interpolation_prefilter = _normalize_sr_interpolation(
-        cfg_sr.slice_interpolation
+        cfg_sr.slice_interpolation,
+        cfg_sr.get("b_spline_order", 3),
     )
     axis_name = str(random.choice(list(cfg_sr.axes))).upper()
     axis_dim = SR_AXIS_TO_DIM[axis_name]
@@ -228,6 +232,9 @@ def apply_random_self_sr(clean: np.ndarray, norm_spacing_zyx, cfg_sr) -> np.ndar
         slice_profile=cfg_sr.slice_profile,
         interpolation_order=interpolation_order,
         interpolation_prefilter=interpolation_prefilter,
+        continuous_sigma_k=cfg_sr.get(
+            "continuous_sigma_k", CONTINUOUS_SR_SIGMA_FACTOR
+        ),
     )
 
 
@@ -403,7 +410,8 @@ def preprocess_image_np(
             if cfg_sr.clamp_thickness_to_interval:
                 slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
             interpolation_order, interpolation_prefilter = _normalize_sr_interpolation(
-                cfg_sr.slice_interpolation
+                cfg_sr.slice_interpolation,
+                cfg_sr.get("b_spline_order", 3),
             )
             src_img = simulate_through_plane_sr(
                 clean,
@@ -414,6 +422,9 @@ def preprocess_image_np(
                 slice_profile=cfg_sr.slice_profile,
                 interpolation_order=interpolation_order,
                 interpolation_prefilter=interpolation_prefilter,
+                continuous_sigma_k=cfg_sr.get(
+                    "continuous_sigma_k", CONTINUOUS_SR_SIGMA_FACTOR
+                ),
             )
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     else:

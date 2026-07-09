@@ -62,8 +62,10 @@ data:
     slice_interval_mm_range: [2.0, 6.0] # 撮像スライス間隔[mm]（学習時はこの範囲でランダム）
     slice_thickness_mm_range: [1.0, 6.0] # スライス厚[mm]（学習時はこの範囲でランダム）
     clamp_thickness_to_interval: true # スライス厚を間隔以下に制限する
-    slice_profile: gaussian # gaussian(FWHM=スライス厚) / box(幅=スライス厚) / continuous(σ=0.32*スライス間隔) / none
-    slice_interpolation: linear # linear / spline / b-spline（b-splineはscipy.zoom order=3, prefilter=False）
+    slice_profile: gaussian # gaussian(FWHM=スライス厚) / box(幅=スライス厚) / continuous(σ=k*スライス間隔) / none
+    continuous_sigma_k: 0.32 # slice_profile=continuous時のk
+    slice_interpolation: linear # linear / spline / b-spline（b-splineはscipy.zoom prefilter=False）
+    b_spline_order: 3 # slice_interpolation=b-spline時のscipy.zoom order（0〜5）
     val_axis: AX # 検証時の固定軸
     val_slice_interval_mm: 4.0 # 検証時の固定スライス間隔[mm]
     val_slice_thickness_mm: 4.0 # 検証時の固定スライス厚[mm]
