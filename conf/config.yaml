@@ -234,6 +234,8 @@ aug:
     random_gamma_range: [1.0,1.0] # 1.0-1.0で無効化
 
   # ランダムクロップの中心を決める方法（検証時は画像中心を使う）
+  # 学習時のみ、元画像z方向の先頭nスライスをランダムcrop候補から外す
+  crop_exclude_start_slices: 0
   # body: 体表マスク(.body.mask.hdr)の矩形内でクロップ / image: 画像全体からクロップ
   random_crop_method:
     body: 0.0

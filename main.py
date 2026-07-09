@@ -80,6 +80,11 @@ def read_cfg_and_parse_arg():
     assert cfg.data.mode in ["paired", "paired_dir", "self_noise", "self_sr"], (
         cfg.data.mode
     )
+    crop_exclude_start = float(cfg.aug.crop_exclude_start_slices)
+    assert crop_exclude_start.is_integer() and crop_exclude_start >= 0, (
+        "aug.crop_exclude_start_slicesは0以上の整数で指定してください"
+        f"（現在: {cfg.aug.crop_exclude_start_slices}）"
+    )
     if cfg.data.mode == "self_sr":
         for axis_name in list(cfg.data.self_sr.axes) + [cfg.data.self_sr.val_axis]:
             assert str(axis_name).upper() in ("AX", "COR", "SAG"), (

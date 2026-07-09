@@ -253,6 +253,24 @@ def get_clip_vals(img_hdr_path: Path, cfg) -> tuple[float, float]:
     return min_val, max_val
 
 
+def _apply_crop_exclude_start_slices(box_zyxzyx, img_size_zyx, cfg_aug):
+    """学習時ランダムcrop候補から、元画像z方向の先頭nスライスを外す。"""
+    exclude_start = int(cfg_aug.get("crop_exclude_start_slices", 0))
+    box_zyxzyx = np.array(box_zyxzyx, dtype=np.float32, copy=True)
+    if exclude_start <= 0:
+        return box_zyxzyx
+
+    img_z = int(img_size_zyx[0])
+    if img_z <= 1:
+        return box_zyxzyx
+
+    z_min = min(max(exclude_start, 0), img_z - 1)
+    box_zyxzyx[0] = max(box_zyxzyx[0], z_min)
+    if box_zyxzyx[3] <= box_zyxzyx[0]:
+        box_zyxzyx[3] = min(float(img_z), box_zyxzyx[0] + 1.0)
+    return box_zyxzyx
+
+
 def get_crop_center(
     img_hdr_path: Path, img_size_zyx, spacing_zyx, is_training: bool, cfg
 ):
@@ -284,6 +302,9 @@ def get_crop_center(
     else:
         raise NotImplementedError(mode)
 
+    box_zyxzyx = _apply_crop_exclude_start_slices(
+        box_zyxzyx, img_size_zyx, cfg.aug
+    )
     return random_crop_center_within_bb(
         box_zyxzyx,
         img_size_zyx,
@@ -717,6 +738,9 @@ def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
 
     # ランダム中心クロップ（回転なしの決定的アフィン）
     box_zyxzyx = np.array([0, 0, 0] + list(img_size_zyx))
+    box_zyxzyx = _apply_crop_exclude_start_slices(
+        box_zyxzyx, img_size_zyx, cfg.aug
+    )
     crop_center_zyx = random_crop_center_within_bb(
         box_zyxzyx,
         img_size_zyx,
