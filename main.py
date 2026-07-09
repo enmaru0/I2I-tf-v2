@@ -85,12 +85,54 @@ def read_cfg_and_parse_arg():
             assert str(axis_name).upper() in ("AX", "COR", "SAG"), (
                 f"self_sr.axes/val_axisはAX/COR/SAGで指定してください: {axis_name}"
             )
+        sr_profile = str(cfg.data.self_sr.slice_profile).lower()
+        assert sr_profile in ("gaussian", "box", "continuous", "none"), (
+            "data.self_sr.slice_profileはgaussian/box/continuous/noneで"
+            f"指定してください（現在: {cfg.data.self_sr.slice_profile}）"
+        )
+        sr_interp = str(cfg.data.self_sr.slice_interpolation).lower().replace("_", "-")
+        assert sr_interp in (
+            "linear",
+            "spline",
+            "b-spline",
+            "bspline",
+            "b-spine",
+            "bspine",
+        ), (
+            "data.self_sr.slice_interpolationはlinear/spline/b-splineで"
+            f"指定してください（現在: {cfg.data.self_sr.slice_interpolation}）"
+        )
     if cfg.data.mode == "paired_dir":
         assert cfg.data.target_data_dir, (
             "paired_dirモードではdata.target_data_dirを指定してください"
         )
         assert Path(cfg.data.target_data_dir).exists(), (
             f"target_data_dirが存在しません: {cfg.data.target_data_dir}"
+        )
+    if cfg.data.real_dc.enabled:
+        assert cfg.data.mode == "self_sr", (
+            "data.real_dcは現状self_srタスク向けです（劣化演算子がthrough-plane SR前提）"
+        )
+        assert cfg.data.real_dc.input_dir, (
+            "real_dc.enabled時はreal_dc.input_dirを指定してください"
+        )
+        assert Path(cfg.data.real_dc.input_dir).exists(), (
+            f"real_dc.input_dirが存在しません: {cfg.data.real_dc.input_dir}"
+        )
+        assert str(cfg.data.real_dc.axis).upper() in ("AX", "COR", "SAG"), (
+            cfg.data.real_dc.axis
+        )
+        dc_supported = {
+            "regression",
+            "pix2pix",
+            "rectified_flow",
+            "i2i_rfr",
+            "i2i_rfr_x0",
+            "resshift",
+            "split_mean_flow",
+        }
+        assert cfg.algorithm.name in dc_supported, (
+            f"real_dcは{sorted(dc_supported)}のみ対応です（現在: {cfg.algorithm.name}）"
         )
     if cfg.test.enabled:
         assert cfg.test.input_dir, "test.enabled時はtest.input_dirを指定してください"

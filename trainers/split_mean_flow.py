@@ -39,6 +39,15 @@ class SplitMeanFlowTrainer(RectifiedFlowTrainer):
     def _cfg_rf(self):
         return self.cfg.algorithm.split_mean_flow
 
+    def _dc_predict01(self, src01, img_msks):
+        """DC損失用: 平均速度場によるt=0→1の1ジャンプ予測（評価1回）"""
+        src_x = self._to_x(src01, img_msks)
+        x0 = self._initial_state(src_x)
+        t = ops.zeros_like(x0[:, :1, :1, :1, :1])
+        s = ops.ones_like(x0[:, :1, :1, :1, :1])
+        u = self._avg_velocity(x0, t, s, src_x, img_msks, training=True)
+        return self._to_01(x0 + u, img_msks)
+
     def _avg_velocity(self, x_t, t, s, src_x, img_msks, training):
         """平均速度場 u(x_t, t, s | source) を予測する。t, sは(b,1,1,1,1)"""
         t_ch = ops.ones_like(x_t) * t

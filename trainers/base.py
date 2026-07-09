@@ -55,7 +55,10 @@ class BaseI2ITrainer(Model):
     @property
     def metrics_dict(self):
         if not hasattr(self, "_metrics_dict") or len(self._metrics_dict) == 0:
-            self._metrics_dict = {name: Mean(name=name) for name in self.METRIC_NAMES}
+            names = list(self.METRIC_NAMES)
+            if self._real_dc_enabled():
+                names.append("real_dc_loss")
+            self._metrics_dict = {name: Mean(name=name) for name in names}
         return self._metrics_dict
 
     def _prepare_batch(self, data, is_training: bool):
@@ -112,6 +115,91 @@ class BaseI2ITrainer(Model):
             return ops.sigmoid(logits)
         else:
             raise NotImplementedError(output_mode)
+
+    # ------------------------------------------------------------------
+    # 実劣化データのdata consistency損失（data.real_dc、self_sr向け半教師あり）
+    # 正解のない実劣化入力に対する予測を微分可能な劣化演算子で再劣化し、
+    # 入力自身と比較する。sim2realギャップの縮小に使う。
+    # ------------------------------------------------------------------
+
+    def _real_dc_enabled(self) -> bool:
+        cfg_dc = self.cfg.data.get("real_dc", None) if self.cfg is not None else None
+        return bool(cfg_dc is not None and cfg_dc.enabled)
+
+    def _dc_predict01(self, src01, img_msks):
+        """
+        DC損失用の安価な予測（1回のネットワーク評価、[0,1]レンジ）。
+        直接予測系(regression/pix2pix)はoutput_mode経由のデフォルト実装を使い、
+        生成系はサブクラスでオーバーライドする。
+        """
+        logits = self([src01, img_msks], training=True)
+        return ops.clip(self._to_image(logits, src01), 0.0, 1.0) * img_msks
+
+    @staticmethod
+    def _axis_gaussian_blur(vol, sigma_px, axis_dim: int):
+        """
+        指定軸に沿ったサンプル別σのガウシアンぼかし（微分可能・静的shape）。
+        ぼかしを(A,A)の帯行列として構築しeinsumで適用する。
+        vol: (b, z, y, x, c) / sigma_px: (b,) / axis_dim: 0(z),1(y),2(x)
+        """
+        length = int(vol.shape[axis_dim + 1])
+        idx = ops.arange(0, length, dtype="float32")
+        diff = idx[None, :, None] - idx[None, None, :]  # (1, A, A)
+        sigma = ops.reshape(ops.maximum(sigma_px, 1e-3), (-1, 1, 1))
+        weight = ops.exp(-0.5 * ops.square(diff / sigma))
+        weight = weight / (ops.sum(weight, axis=2, keepdims=True) + 1e-8)
+        einsum_expr = {
+            0: "bij,bjyxc->biyxc",
+            1: "bij,bzjxc->bzixc",
+            2: "bij,bzyjc->bzyic",
+        }[axis_dim]
+        return ops.einsum(einsum_expr, weight, vol)
+
+    def _real_dc_loss(self, data):
+        """
+        実劣化入力へのdata consistency損失を返す: (重み付き損失, 生の損失)。
+        劣化演算子は「スライスプロファイル+間引き補間の実効平滑化」を
+        軸方向ガウシアン(σはロード時にサンプル別計算)で近似したもの。
+        train_stepのGradientTape内で呼ぶこと。
+        """
+        from data.dataloader import SR_AXIS_TO_DIM
+
+        cfg_dc = self.cfg.data.real_dc
+        msk = data["real_msks"]
+        real01 = (
+            normalize(
+                data["real_imgs"],
+                data["real_min_clip_vals"],
+                data["real_max_clip_vals"],
+            )
+            * msk
+        )
+        pred01 = self._dc_predict01(real01, msk)
+
+        axis_dim = SR_AXIS_TO_DIM[str(cfg_dc.axis).upper()]
+        degraded = self._axis_gaussian_blur(pred01, data["real_sigma_px"], axis_dim)
+        diff = (degraded - real01) * msk
+        if cfg_dc.loss == "l1":
+            raw = ops.sum(ops.abs(diff)) / (ops.sum(msk) + 1e-6)
+        elif cfg_dc.loss == "mse":
+            raw = ops.sum(ops.square(diff)) / (ops.sum(msk) + 1e-6)
+        else:
+            raise NotImplementedError(cfg_dc.loss)
+
+        # warmup: 主損失が形になる前にDCが支配しないよう線形に立ち上げる
+        # （step+1で初回ステップから重みが0にならないようにする）
+        step = ops.cast(self.optimizer.iterations, "float32") + 1.0
+        warmup = float(max(int(cfg_dc.warmup_steps), 1))
+        weight = float(cfg_dc.weight) * ops.minimum(1.0, step / warmup)
+        return weight * raw, raw
+
+    def _add_real_dc_loss(self, loss, data):
+        """train_stepのtape内から呼ぶ。DC有効時に損失へ加算しメトリクスを更新する"""
+        if not self._real_dc_enabled():
+            return loss
+        weighted, raw = self._real_dc_loss(data)
+        self.metrics_dict["real_dc_loss"].update_state(raw)
+        return loss + weighted
 
     def train_step(self, data):
         """

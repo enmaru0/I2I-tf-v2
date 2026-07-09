@@ -29,6 +29,7 @@ class RegressionTrainer(BaseI2ITrainer):
             total_loss = self._compute_loss_and_metrics(
                 logits, src_imgs, tgt_imgs, img_msks
             )
+            total_loss = self._add_real_dc_loss(total_loss, data)
         trainable_weights = self.generator.trainable_variables
         gradients = tape.gradient(total_loss, trainable_weights)
         self.optimizer.apply_gradients(zip(gradients, trainable_weights))

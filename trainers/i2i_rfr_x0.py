@@ -51,6 +51,14 @@ class I2IRFRX0Trainer(RectifiedFlowTrainer):
         x0 = self([net_in, img_msks], training=training)
         return x0 * img_msks
 
+    def _dc_predict01(self, src01, img_msks):
+        """DC損失用: t=1（純ノイズ）からのx0直接予測（評価1回）"""
+        src_x = self._to_x(src01, img_msks)
+        x_t = tf.random.normal(tf.shape(src_x))
+        t = ops.ones_like(src_x[:, :1, :1, :1, :1])
+        x0_pred = self._predict_x0(x_t, t, src_x, img_msks, training=True)
+        return self._to_01(x0_pred, img_msks)
+
     def _sample_t(self, batch_size):
         """密度∝t^pの時刻サンプリング（[t_min, 1]にクリップ）"""
         cfg = self._cfg_rf()

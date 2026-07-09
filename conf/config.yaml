@@ -54,7 +54,7 @@ data:
       length_range: [3.0, 9.0] # 学習時のブレ長さ範囲
       val_length: 0.0 # 検証時の固定長さ（0で無効。方向はファイル毎にシード固定）
   # through-plane SR (data.mode=self_sr のときに使用)
-  # 劣化は「スライスプロファイルぼかし→スライス間隔で間引き→元グリッドへ補間」の順
+  # 劣化は「スライスプロファイルぼかし→スライス間隔でダウンサンプリング→元グリッドへ補間」の順
   # （edm-torchのThroughPlaneSuperResolution physicalモード相当）
   # 間隔・厚みのpx換算はアフィン変換後のスペーシング(aug.affine.norm_spacing_zyx)基準
   self_sr:
@@ -62,11 +62,30 @@ data:
     slice_interval_mm_range: [2.0, 6.0] # 撮像スライス間隔[mm]（学習時はこの範囲でランダム）
     slice_thickness_mm_range: [1.0, 6.0] # スライス厚[mm]（学習時はこの範囲でランダム）
     clamp_thickness_to_interval: true # スライス厚を間隔以下に制限する
-    slice_profile: gaussian # gaussian(FWHM=スライス厚) / box(幅=スライス厚) / none
-    slice_interpolation: linear # linear or spline（間引き・元グリッドへ戻す補間）
+    slice_profile: gaussian # gaussian(FWHM=スライス厚) / box(幅=スライス厚) / continuous(σ=0.32*スライス間隔) / none
+    slice_interpolation: linear # linear / spline / b-spline（b-splineはscipy.zoom order=3, prefilter=False）
     val_axis: AX # 検証時の固定軸
     val_slice_interval_mm: 4.0 # 検証時の固定スライス間隔[mm]
     val_slice_thickness_mm: 4.0 # 検証時の固定スライス厚[mm]
+  # 実劣化データのdata consistency損失（self_sr向け半教師あり学習）
+  # 正解のない実劣化画像に対する予測を微分可能な劣化演算子（軸方向ガウシアン近似）
+  # で再劣化し、入力自身と比較する。sim2realギャップの縮小に使う。
+  # 対応アルゴリズム: regression / pix2pix / rectified_flow / i2i_rfr /
+  #                   i2i_rfr_x0 / resshift / split_mean_flow（edmは非対応）
+  real_dc:
+    enabled: False
+    input_dir: "" # 実劣化画像(.hdr/.raw)のフォルダ（正解不要。probe/testと同じ形式）
+    weight: 0.05 # DC損失の重み
+    warmup_steps: 2000 # 重みを線形に立ち上げるステップ数（主損失の学習が先）
+    axis: AX # 実データの厚肉軸（AX=z / COR=y / SAG=x。固定。ヘッダで確認して指定）
+    slice_interval_mm: null # nullでヘッダの厚肉軸スペーシングを使う
+    # 注意: スキャナ側で薄スライスへ補間済みのデータはヘッダが実効間隔を
+    # 反映しないため、撮像プロトコルの値を明示的に指定すること
+    slice_thickness_mm: null # nullでslice_interval_mmと同値
+    # 「間引き→補間」の実効平滑化をσ=factor*間隔px のガウシアンで近似する係数
+    # （劣化全体を σ=sqrt(σ_profile^2+σ_interp^2) の軸方向ぼかしで表す）
+    interp_sigma_factor: 0.35
+    loss: l1 # l1 or mse
 
 # 画像変換アルゴリズムの選択と設定
 # 比較実験は --overrides algorithm.name=pix2pix exp_dir=results/pix2pix のように行う

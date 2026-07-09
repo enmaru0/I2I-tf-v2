@@ -100,6 +100,15 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
             x = x_next
         return x
 
+    def _dc_predict01(self, src01, img_msks):
+        """DC損失用の1ステップ予測: x1_hat = x0 + v(x0, t=0)（評価1回）
+        i2i_rfrでは_initial_stateがsource起点なので実運用の1ステップ推論と一致する"""
+        src_x = self._to_x(src01, img_msks)
+        x0 = self._initial_state(src_x)
+        t = ops.zeros_like(x0[:, :1, :1, :1, :1])
+        v = self._velocity(x0, t, src_x, img_msks, training=True)
+        return self._to_01(x0 + v, img_msks)
+
     def train_step(self, data):
         """
         ここはjit_compileされているのでtensorboardを含むCPUを使う処理はかけない
@@ -110,6 +119,7 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
 
         with GradientTape() as tape:
             loss, x1_hat = self._flow_loss(y, src_x, img_msks, training=True)
+            loss = self._add_real_dc_loss(loss, data)
         gradients = tape.gradient(loss, self.generator.trainable_variables)
         self.optimizer.apply_gradients(
             zip(gradients, self.generator.trainable_variables)

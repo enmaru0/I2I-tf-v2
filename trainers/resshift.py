@@ -81,6 +81,23 @@ class ResShiftTrainer(BaseI2ITrainer):
         x0 = self([net_in, img_msks], training=training)
         return x0 * img_msks
 
+    def _dc_predict01(self, src01, img_msks):
+        """DC損失用: t=T（x_T=source、決定的）からのx0直接予測（評価1回）"""
+        cfg = self._cfg_rs()
+        num_steps = int(cfg.num_steps)
+        eta = resshift_eta_schedule(num_steps, cfg.kappa, cfg.schedule_p)
+        src_x = self._to_x(src01, img_msks)
+        mode = cfg.time_condition
+        if mode == "eta":
+            time_cond_val = eta[num_steps]
+        elif mode == "sqrt_eta":
+            time_cond_val = math.sqrt(max(eta[num_steps], 0.0))
+        else:  # "t"
+            time_cond_val = 1.0
+        time_cond = ops.ones_like(src_x[:, :1, :1, :1, :1]) * time_cond_val
+        x0_pred = self._predict_x0(src_x, time_cond, src_x, img_msks, training=True)
+        return self._to_01(x0_pred, img_msks)
+
     def _denoise_loss(self, y, src_x, img_msks, training):
         """一様なt∈{1..T}で残差シフト拡散のx0再構成損失を計算する"""
         cfg = self._cfg_rs()
@@ -158,6 +175,7 @@ class ResShiftTrainer(BaseI2ITrainer):
 
         with GradientTape() as tape:
             loss, x0_pred = self._denoise_loss(y, src_x, img_msks, training=True)
+            loss = self._add_real_dc_loss(loss, data)
         gradients = tape.gradient(loss, self.generator.trainable_variables)
         self.optimizer.apply_gradients(
             zip(gradients, self.generator.trainable_variables)

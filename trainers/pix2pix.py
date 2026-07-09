@@ -83,6 +83,7 @@ class Pix2PixTrainer(BaseI2ITrainer):
             g_adv = self._gan_loss(d_fake_for_g, is_real=True)
             l1 = masked_l1_loss(tgt_imgs, preds, img_msks)
             g_total = cfg_p2p.l1_weight * l1 + cfg_p2p.gan_weight * g_adv
+            g_total = self._add_real_dc_loss(g_total, data)
         g_grads = g_tape.gradient(g_total, self.generator.trainable_variables)
         self.optimizer.apply_gradients(zip(g_grads, self.generator.trainable_variables))
 

@@ -90,9 +90,24 @@ def apply_motion_blur(img: np.ndarray, direction_zyx, length: float) -> np.ndarr
 
 # through-plane SRの劣化軸（データはz,y,x順）: AX=z / COR=y / SAG=x
 SR_AXIS_TO_DIM = {"AX": 0, "COR": 1, "SAG": 2}
+CONTINUOUS_SR_SIGMA_FACTOR = 0.32
 
 
-def _resize_axis0(vol: np.ndarray, out_n: int, order: int) -> np.ndarray:
+def _normalize_sr_interpolation(slice_interpolation: str) -> tuple[int, bool]:
+    """self_srの補間設定をscipy.zoomのorder/prefilterへ変換する。"""
+    method = str(slice_interpolation).lower().replace("_", "-")
+    if method == "linear":
+        return 1, False
+    if method == "spline":
+        return 3, True
+    if method in ("b-spline", "bspline", "b-spine", "bspine"):
+        return 3, False
+    raise NotImplementedError(slice_interpolation)
+
+
+def _resize_axis0(
+    vol: np.ndarray, out_n: int, order: int, prefilter: bool = True
+) -> np.ndarray:
     """軸0のスライス数をout_nに変える（scipy.zoom。端数はcrop/padで厳密に合わせる）"""
     out_n = int(out_n)
     if vol.shape[0] == out_n:
@@ -100,7 +115,12 @@ def _resize_axis0(vol: np.ndarray, out_n: int, order: int) -> np.ndarray:
     order = int(order)
     if order > 1 and vol.shape[0] < 4:
         order = 1  # スライス数が少なすぎるときはスプラインを使わない
-    out = zoom(vol, (out_n / vol.shape[0], 1.0, 1.0), order=order)
+    out = zoom(
+        vol,
+        (out_n / vol.shape[0], 1.0, 1.0),
+        order=order,
+        prefilter=bool(prefilter) and order > 1,
+    )
     if out.shape[0] > out_n:
         start = (out.shape[0] - out_n) // 2
         out = out[start : start + out_n]
@@ -119,11 +139,15 @@ def simulate_through_plane_sr(
     slice_thickness_mm: float,
     slice_profile: str = "gaussian",
     interpolation_order: int = 1,
+    interpolation_prefilter: bool = True,
 ) -> np.ndarray:
     """
     スライス方向の低解像度撮像をシミュレートする（edm-torchの
     ThroughPlaneSuperResolution physicalモード相当）。
-    1. スライスプロファイルぼかし（gaussian: FWHM=スライス厚 / box: 幅=スライス厚）
+    1. スライスプロファイルぼかし
+       - gaussian: FWHM=スライス厚
+       - box: 幅=スライス厚
+       - continuous: sigma=スライス間隔*0.32
     2. スライス間隔に合わせて間引き
     3. 元グリッドへ補間で戻す（出力サイズは入力と同じ）
     """
@@ -131,23 +155,35 @@ def simulate_through_plane_sr(
     interval_px = max(float(slice_interval_mm) / float(axis_spacing_mm), 1.0)
     thickness_px = max(float(slice_thickness_mm) / float(axis_spacing_mm), 1.0)
 
-    if slice_profile == "none" or thickness_px <= 1.0:
+    slice_profile = str(slice_profile).lower()
+    if slice_profile == "none":
+        pass
+    elif slice_profile == "gaussian" and thickness_px <= 1.0:
         pass
     elif slice_profile == "gaussian":
         sigma = thickness_px / 2.3548  # FWHM -> sigma
         axis_first = gaussian_filter(axis_first, sigma=(sigma, 0.0, 0.0))
+    elif slice_profile == "box" and thickness_px <= 1.0:
+        pass
     elif slice_profile == "box":
         size = max(1, int(round(thickness_px)))
         if size > 1:
             axis_first = uniform_filter1d(axis_first, size=size, axis=0, mode="nearest")
+    elif slice_profile == "continuous":
+        sigma = interval_px * CONTINUOUS_SR_SIGMA_FACTOR
+        axis_first = gaussian_filter(axis_first, sigma=(sigma, 0.0, 0.0))
     else:
         raise NotImplementedError(slice_profile)
 
     n_axis = axis_first.shape[0]
     low_n = int(round((n_axis - 1) / interval_px)) + 1 if n_axis > 1 else 1
     low_n = max(1, min(n_axis, low_n))
-    lowres = _resize_axis0(axis_first, low_n, interpolation_order)
-    upsampled = _resize_axis0(lowres, n_axis, interpolation_order)
+    lowres = _resize_axis0(
+        axis_first, low_n, interpolation_order, interpolation_prefilter
+    )
+    upsampled = _resize_axis0(
+        lowres, n_axis, interpolation_order, interpolation_prefilter
+    )
     return np.moveaxis(upsampled, 0, axis_dim).astype(np.float32, copy=False)
 
 
@@ -174,7 +210,9 @@ def apply_random_self_sr(clean: np.ndarray, norm_spacing_zyx, cfg_sr) -> np.ndar
     self_srの学習時ランダム劣化（軸・スライス間隔・厚みをサンプリング）。
     学習ローダとprobe_sim2real.pyの両方から使う。
     """
-    interpolation_order = {"linear": 1, "spline": 3}[cfg_sr.slice_interpolation]
+    interpolation_order, interpolation_prefilter = _normalize_sr_interpolation(
+        cfg_sr.slice_interpolation
+    )
     axis_name = str(random.choice(list(cfg_sr.axes))).upper()
     axis_dim = SR_AXIS_TO_DIM[axis_name]
     slice_interval_mm = np.random.uniform(*cfg_sr.slice_interval_mm_range)
@@ -189,6 +227,7 @@ def apply_random_self_sr(clean: np.ndarray, norm_spacing_zyx, cfg_sr) -> np.ndar
         slice_thickness_mm,
         slice_profile=cfg_sr.slice_profile,
         interpolation_order=interpolation_order,
+        interpolation_prefilter=interpolation_prefilter,
     )
 
 
@@ -363,6 +402,9 @@ def preprocess_image_np(
             slice_thickness_mm = float(cfg_sr.val_slice_thickness_mm)
             if cfg_sr.clamp_thickness_to_interval:
                 slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
+            interpolation_order, interpolation_prefilter = _normalize_sr_interpolation(
+                cfg_sr.slice_interpolation
+            )
             src_img = simulate_through_plane_sr(
                 clean,
                 axis_dim,
@@ -370,9 +412,8 @@ def preprocess_image_np(
                 slice_interval_mm,
                 slice_thickness_mm,
                 slice_profile=cfg_sr.slice_profile,
-                interpolation_order={"linear": 1, "spline": 3}[
-                    cfg_sr.slice_interpolation
-                ],
+                interpolation_order=interpolation_order,
+                interpolation_prefilter=interpolation_prefilter,
             )
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     else:
@@ -619,9 +660,142 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
         return make_batch_dict(*args, cfg)
 
     dataset = dataset.map(_make_batch_dict)
+
+    # 実劣化データのDC損失用ストリームを合流させる（data.real_dc、学習時のみ）
+    cfg_dc = cfg.data.get("real_dc", None)
+    if is_training and cfg_dc is not None and cfg_dc.enabled:
+        real_dataset = _make_real_dc_dataset(cfg)
+        dataset = tf.data.Dataset.zip((dataset, real_dataset)).map(
+            lambda main, real: {**main, **real}
+        )
+
     dataset = dataset.prefetch(buffer_size=cfg.prefetch_size)
 
     return dataset
+
+
+def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
+    """
+    DC損失用の実劣化画像を読み込む。
+    - ランダム中心クロップ + norm_spacingへのリサンプル
+    - 回転・反転・スケールなし（劣化軸をパッチ軸に揃えるため。学習側の
+      幾何拡張とは独立）
+    - 劣化演算子のσ[px]をヘッダ/設定から計算して返す:
+        σ = sqrt(σ_profile^2 + σ_interp^2)
+        σ_profile = スライス厚px / 2.3548 (FWHM→σ)
+        σ_interp  = interp_sigma_factor * スライス間隔px（間引き→補間の実効平滑化の近似）
+    """
+    cfg_dc = cfg.data.real_dc
+    hdr_path = Path(hdr_path_bytes.decode())
+    crop_size_zyx = cfg.aug.crop_size_zyx
+    img_size_zyx, img_dtype, spacing_zyx = read_hdr(hdr_path)
+
+    axis_dim = SR_AXIS_TO_DIM[str(cfg_dc.axis).upper()]
+    interval_mm = cfg_dc.slice_interval_mm
+    interval_mm = float(spacing_zyx[axis_dim]) if interval_mm is None else float(interval_mm)
+    thickness_mm = cfg_dc.slice_thickness_mm
+    thickness_mm = interval_mm if thickness_mm is None else float(thickness_mm)
+    axis_spacing = float(cfg.aug.affine.norm_spacing_zyx[axis_dim])
+    thickness_px = max(thickness_mm / axis_spacing, 1.0)
+    interval_px = max(interval_mm / axis_spacing, 1.0)
+    sigma_profile = thickness_px / 2.3548 if thickness_px > 1.0 else 0.0
+    sigma_interp = (
+        float(cfg_dc.interp_sigma_factor) * interval_px if interval_px > 1.0 else 0.0
+    )
+    sigma_px = float(np.sqrt(sigma_profile**2 + sigma_interp**2))
+
+    # ランダム中心クロップ（回転なしの決定的アフィン）
+    box_zyxzyx = np.array([0, 0, 0] + list(img_size_zyx))
+    crop_center_zyx = random_crop_center_within_bb(
+        box_zyxzyx,
+        img_size_zyx,
+        crop_size_zyx,
+        spacing_zyx,
+        cfg.aug.affine.norm_spacing_zyx,
+        [0, 0, 0],
+    )
+    affine_transform = AffineTransform(crop_size_zyx=crop_size_zyx, **cfg.aug.affine)
+    affine_matrix = affine_transform.get_affine(
+        spacing_zyx, crop_center_zyx, is_training=False
+    )
+    img_region_zyxzyx, shift_start = calc_img_crop_region(
+        crop_size_zyx, affine_matrix, [0, 0, 0], img_size_zyx
+    )
+    affine_matrix = affine_transform.fix_start(affine_matrix, shift_start)
+
+    min_val, max_val = get_clip_vals(hdr_path, cfg)
+    img = read_raw(
+        hdr_path,
+        clip_zyxzyx=img_region_zyxzyx,
+        img_dtype=img_dtype,
+        size_zyx=img_size_zyx,
+        use_memmap=True,
+    )
+    ones = np.ones(img.shape, np.uint8)
+    img_msk = affine_transform.apply(ones, affine_matrix, order=0, cval=0)
+    img = affine_transform.apply(img, affine_matrix, order=1)
+
+    return (
+        add_channel_dim(img.astype(np.int16, copy=False)),
+        add_channel_dim(img_msk),
+        np.array(min_val, np.float32),
+        np.array(max_val, np.float32),
+        np.array(sigma_px, np.float32),
+    )
+
+
+def _make_real_dc_dataset(cfg):
+    """DC損失用の実劣化データストリーム（無限リピート・バッチ済み辞書）を作る"""
+    cfg_dc = cfg.data.real_dc
+    input_dir = Path(cfg_dc.input_dir)
+    hdr_list = [
+        p
+        for p in sorted(input_dir.glob("*.hdr"))
+        if ".mask" not in p.name and not p.stem.endswith(cfg.data.target_suffix)
+    ]
+    assert len(hdr_list) > 0, f"real_dc.input_dirに画像がありません: {input_dir}"
+    logging.info(f"real_dc: {len(hdr_list)} volumes from {input_dir}")
+
+    if cfg.image.modality == "MR":
+        for hdr_path in hdr_list:
+            save_intensity(
+                str(hdr_path),
+                min_percentile=cfg.image.MR.min_percentile,
+                max_percentile=cfg.image.MR.max_percentile,
+            )
+
+    def _preprocess(hdr_path_bytes):
+        def _np_func(hdr_path_bytes):
+            return preprocess_real_dc_image_np(hdr_path_bytes, cfg)
+
+        img, msk, min_val, max_val, sigma_px = tf.numpy_function(
+            func=_np_func,
+            inp=[hdr_path_bytes],
+            Tout=[tf.int16, tf.uint8, tf.float32, tf.float32, tf.float32],
+        )
+        img_shape = tuple(cfg.aug.crop_size_zyx) + (1,)
+        img.set_shape(img_shape)
+        msk.set_shape(img_shape)
+        min_val.set_shape(())
+        max_val.set_shape(())
+        sigma_px.set_shape(())
+        return img, msk, min_val, max_val, sigma_px
+
+    dataset = tf.data.Dataset.from_tensor_slices([str(p) for p in hdr_list])
+    dataset = dataset.repeat().shuffle(buffer_size=len(hdr_list))
+    dataset = dataset.map(_preprocess, num_parallel_calls=cfg.num_workers)
+    dataset = dataset.batch(cfg.batch_size, drop_remainder=True)
+
+    def _make_dict(img, msk, min_val, max_val, sigma_px):
+        return dict(
+            real_imgs=tf.cast(img, tf.float32),
+            real_msks=tf.cast(msk, tf.float32),
+            real_min_clip_vals=min_val,
+            real_max_clip_vals=max_val,
+            real_sigma_px=sigma_px,
+        )
+
+    return dataset.map(_make_dict)
 
 
 def preprocess_test_image_np(hdr_path: Path, cfg):
