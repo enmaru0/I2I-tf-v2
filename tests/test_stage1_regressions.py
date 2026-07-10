@@ -105,6 +105,8 @@ class Stage1RegressionTests(unittest.TestCase):
             data1["sample_seeds"].numpy(), data2["sample_seeds"].numpy()
         )
         self.assertEqual(tuple(data1["sample_seeds"].shape), (2, 2))
+        self.assertNotIn("img_ids", data1)
+        self.assertTrue(all(value.dtype != tf.string for value in data1.values()))
 
     def test_optimizer_iterations_unwraps_loss_scale_optimizer(self):
         iterations = object()

@@ -731,7 +731,6 @@ def make_batch_dict(
         src_max_clip_vals=src_max_clip_vals,
         tgt_min_clip_vals=tgt_min_clip_vals,
         tgt_max_clip_vals=tgt_max_clip_vals,
-        img_ids=img_hdr_list,
         sample_seeds=tf.cast(sample_seeds, tf.int32),
     )
     if cfg.debug_dataloader:
