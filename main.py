@@ -6,6 +6,7 @@ from pathlib import Path
 
 import keras
 import numpy as np
+import tensorflow as tf
 from absl import logging
 from keras.api.callbacks import ModelCheckpoint, TerminateOnNaN
 from keras.api.optimizers import SGD, AdamW
@@ -17,8 +18,10 @@ from callbacks import (
     ImageLogger,
     TestImageLogger,
     UnifiedTensorBoardLogger,
+    WallTimeLimit,
 )
 from data.dataloader import create_dataloader, create_test_batch, resolve_target_hdr_path
+from optimizer_utils import get_optimizer_iterations
 from trainers import MODEL_REGISTRY, BaseI2ITrainer, attach_aux_optimizers, build_trainer
 
 
@@ -68,6 +71,11 @@ def read_cfg_and_parse_arg():
 
     # その他cfgのチェック
     assert cfg.image.modality in ["CT", "MR"], cfg.image.modality
+    assert cfg.mixed_precision_policy in (
+        "float32",
+        "mixed_float16",
+        "mixed_bfloat16",
+    ), cfg.mixed_precision_policy
     # U-Netのmodeに応じてクロップzサイズの割り切れ制約をチェックする
     unet_mode = cfg.model.unet.get("mode", "3d")
     assert unet_mode in ["3d", "mixed", "2d"], unet_mode
@@ -76,6 +84,17 @@ def read_cfg_and_parse_arg():
     assert crop_z % z_div == 0, (
         f"model.unet.mode={unet_mode}ではcrop_size_zyxのzは{z_div}の倍数にしてください"
         f"（現在: {crop_z}）"
+    )
+    xy_div = 2**cfg.model.unet.depth
+    for axis, crop_size in zip(("y", "x"), cfg.aug.crop_size_zyx[1:]):
+        assert int(crop_size) % xy_div == 0, (
+            f"crop_size_zyxの{axis}は{xy_div}の倍数にしてください"
+        )
+    assert 0.0 <= float(cfg.inference.overlap) < 1.0, (
+        "inference.overlapは0以上1未満で指定してください"
+    )
+    assert int(cfg.inference.batch_size) >= 1, (
+        "inference.batch_sizeは1以上を指定してください"
     )
     assert cfg.data.mode in ["paired", "paired_dir", "self_noise", "self_sr"], (
         cfg.data.mode
@@ -90,6 +109,13 @@ def read_cfg_and_parse_arg():
         "aug.crop_exclude_start_slicesは0以上の整数で指定してください"
         f"（現在: {cfg.aug.crop_exclude_start_slices}）"
     )
+    assert int(cfg.evaluation.val_patches_per_volume) >= 1, (
+        "evaluation.val_patches_per_volumeは1以上を指定してください"
+    )
+    for axis_name in cfg.evaluation.ssim_axes:
+        assert str(axis_name) in ("z", "y", "x"), (
+            f"evaluation.ssim_axesはz/y/xで指定してください: {axis_name}"
+        )
     if cfg.data.mode == "self_sr":
         for axis_name in list(cfg.data.self_sr.axes) + [cfg.data.self_sr.val_axis]:
             assert str(axis_name).upper() in ("AX", "COR", "SAG"), (
@@ -123,6 +149,17 @@ def read_cfg_and_parse_arg():
                 "data.self_sr.b_spline_orderは0〜5で指定してください"
                 f"（現在: {cfg.data.self_sr.b_spline_order}）"
             )
+        assert int(cfg.data.self_sr.acquisition_order) in (0, 1), (
+            "data.self_sr.acquisition_orderは0または1を指定してください"
+        )
+        assert int(cfg.data.self_sr.val_slice_phase_px) >= 0, (
+            "data.self_sr.val_slice_phase_pxは0以上を指定してください"
+        )
+        for protocol in cfg.data.self_sr.protocols:
+            assert str(protocol.axis).upper() in ("AX", "COR", "SAG"), protocol
+            assert float(protocol.slice_interval_mm) > 0.0, protocol
+            assert float(protocol.get("slice_thickness_mm", 1.0)) > 0.0, protocol
+            assert float(protocol.get("weight", 1.0)) > 0.0, protocol
     if cfg.data.mode == "paired_dir":
         assert cfg.data.target_data_dir, (
             "paired_dirモードではdata.target_data_dirを指定してください"
@@ -164,6 +201,13 @@ def read_cfg_and_parse_arg():
         f"algorithm.name={cfg.algorithm.name} は未実装です。"
         f"利用可能: {list(MODEL_REGISTRY.keys())}"
     )
+    if cfg.algorithm.name == "edm":
+        assert int(cfg.algorithm.edm.num_steps) >= 1, (
+            "algorithm.edm.num_stepsは1以上を指定してください"
+        )
+        assert int(cfg.algorithm.edm.num_steps_val) >= 1, (
+            "algorithm.edm.num_steps_valは1以上を指定してください"
+        )
     assert cfg.model.num_channel == 1, (
         "グレースケール画像変換なのでmodel.num_channelは1を指定してください"
     )
@@ -281,6 +325,10 @@ if __name__ == "__main__":
     OmegaConf.save(cfg, cfg.exp_dir / "output.yaml")
 
     gpu_setting(cfg.gpu, cfg.gpu_allow_growth)
+    keras.utils.set_random_seed(int(cfg.reproducibility.seed))
+    if cfg.reproducibility.deterministic_ops:
+        tf.config.experimental.enable_op_determinism()
+    keras.mixed_precision.set_global_policy(cfg.mixed_precision_policy)
     tensorboard_dir = cfg.exp_dir / "tensorboard_logs"
 
     # 学習データリストを準備
@@ -377,7 +425,7 @@ if __name__ == "__main__":
         model.cfg = cfg
         # 補助optimizer(discriminator用など)は状態が復元されないので再作成する
         attach_aux_optimizers(model, cfg)
-        step = model.optimizer.iterations.numpy()
+        step = get_optimizer_iterations(model.optimizer).numpy()
         logging.info(f"Restoring from {cfg.restore}. (step: {step})")
         initial_epoch = step // cfg.eval_every
     elif cfg.finetune:
@@ -401,6 +449,8 @@ if __name__ == "__main__":
     # スワップインされたままなので、検証と同じEMA重みで推論される）
     if test_logger_callback is not None:
         callbacks.append(test_logger_callback)
+    if float(cfg.max_train_minutes) > 0:
+        callbacks.append(WallTimeLimit(cfg.max_train_minutes))
     # EMAコールバックは検証・チェックポイント保存後に重みを戻す必要があるため、
     # 必ずModelCheckpointより後（末尾）に追加する
     if cfg.ema.enabled:

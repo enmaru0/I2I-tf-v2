@@ -2,7 +2,12 @@ import keras
 from keras.src import ops
 from tensorflow import GradientTape
 
-from losses import masked_l1_loss, masked_l2_loss, masked_psnr, ssim
+from losses import (
+    masked_l1_loss,
+    masked_l2_loss,
+    masked_psnr_per_sample,
+    ssim_per_sample,
+)
 
 from .base import BaseI2ITrainer
 
@@ -30,8 +35,9 @@ class RegressionTrainer(BaseI2ITrainer):
                 logits, src_imgs, tgt_imgs, img_msks
             )
             total_loss = self._add_real_dc_loss(total_loss, data)
+            scaled_loss = self._scale_loss_for_optimizer(total_loss, self.optimizer)
         trainable_weights = self.generator.trainable_variables
-        gradients = tape.gradient(total_loss, trainable_weights)
+        gradients = tape.gradient(scaled_loss, trainable_weights)
         self.optimizer.apply_gradients(zip(gradients, trainable_weights))
 
         return self._get_metrics_result()
@@ -45,19 +51,20 @@ class RegressionTrainer(BaseI2ITrainer):
 
         l1 = masked_l1_loss(tgt_imgs, preds, img_msks)
         l2 = masked_l2_loss(tgt_imgs, preds, img_msks)
-        ssim_val = ssim(tgt_imgs, preds_clipped)
+        ssim_values = ssim_per_sample(tgt_imgs, preds_clipped, msk=img_msks)
+        ssim_val = ops.mean(ssim_values)
         ssim_loss = 1.0 - ssim_val
 
         total_loss = cfg_loss.l1 * l1 + cfg_loss.l2 * l2 + cfg_loss.ssim * ssim_loss
 
         # 評価指標はクリップ後の予測で計算する
-        psnr = masked_psnr(tgt_imgs, preds_clipped, img_msks)
+        psnr = masked_psnr_per_sample(tgt_imgs, preds_clipped, img_msks)
 
         self.metrics_dict["l1_loss"].update_state(l1)
         self.metrics_dict["l2_loss"].update_state(l2)
         self.metrics_dict["ssim_loss"].update_state(ssim_loss)
         self.metrics_dict["total_loss"].update_state(total_loss)
         self.metrics_dict["psnr"].update_state(psnr)
-        self.metrics_dict["ssim"].update_state(ssim_val)
+        self.metrics_dict["ssim"].update_state(ssim_values)
 
         return total_loss

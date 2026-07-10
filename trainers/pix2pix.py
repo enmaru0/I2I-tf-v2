@@ -3,7 +3,7 @@ from keras import Model
 from keras.src import ops
 from tensorflow import GradientTape
 
-from losses import masked_l1_loss, masked_psnr, ssim
+from losses import masked_l1_loss, masked_psnr_per_sample, ssim_per_sample
 
 from .base import BaseI2ITrainer
 
@@ -84,7 +84,8 @@ class Pix2PixTrainer(BaseI2ITrainer):
             l1 = masked_l1_loss(tgt_imgs, preds, img_msks)
             g_total = cfg_p2p.l1_weight * l1 + cfg_p2p.gan_weight * g_adv
             g_total = self._add_real_dc_loss(g_total, data)
-        g_grads = g_tape.gradient(g_total, self.generator.trainable_variables)
+            g_scaled = self._scale_loss_for_optimizer(g_total, self.optimizer)
+        g_grads = g_tape.gradient(g_scaled, self.generator.trainable_variables)
         self.optimizer.apply_gradients(zip(g_grads, self.generator.trainable_variables))
 
         # --- Discriminatorの更新 ---
@@ -97,7 +98,8 @@ class Pix2PixTrainer(BaseI2ITrainer):
                 self._gan_loss(d_real, is_real=True)
                 + self._gan_loss(d_fake, is_real=False)
             )
-        d_grads = d_tape.gradient(d_loss, self.discriminator.trainable_variables)
+            d_scaled = self._scale_loss_for_optimizer(d_loss, self.d_optimizer)
+        d_grads = d_tape.gradient(d_scaled, self.discriminator.trainable_variables)
         self.d_optimizer.apply_gradients(
             zip(d_grads, self.discriminator.trainable_variables)
         )
@@ -133,8 +135,8 @@ class Pix2PixTrainer(BaseI2ITrainer):
     def _update_metrics(
         self, l1, g_adv, g_total, d_loss, tgt_imgs, preds_clipped, img_msks
     ):
-        psnr = masked_psnr(tgt_imgs, preds_clipped, img_msks)
-        ssim_val = ssim(tgt_imgs, preds_clipped)
+        psnr = masked_psnr_per_sample(tgt_imgs, preds_clipped, img_msks)
+        ssim_val = ssim_per_sample(tgt_imgs, preds_clipped, msk=img_msks)
 
         self.metrics_dict["l1_loss"].update_state(l1)
         self.metrics_dict["g_adv_loss"].update_state(g_adv)

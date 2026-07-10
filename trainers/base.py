@@ -1,4 +1,5 @@
 import keras
+import tensorflow as tf
 from keras import Model
 from keras.api.metrics import Mean
 from keras.src import ops
@@ -10,6 +11,7 @@ from data.gpu_aug import (
     random_gamma_correction,
     random_normalize,
 )
+from optimizer_utils import get_optimizer_iterations
 
 
 @keras.saving.register_keras_serializable()
@@ -105,6 +107,41 @@ class BaseI2ITrainer(Model):
         """作業空間[-1,1]から[0,1]の画像へ"""
         return ops.clip((x + 1.0) / 2.0, 0.0, 1.0) * img_msks
 
+    def _validation_sample_seeds(self, data):
+        cfg_repro = self.cfg.get("reproducibility", {})
+        if not bool(cfg_repro.get("fixed_validation_noise", True)):
+            return None
+        return data.get("sample_seeds")
+
+    @staticmethod
+    def _normal_like(reference, sample_seeds=None, salt: int = 0):
+        """症例別seedがあればstateless、なければ通常の正規乱数を返す。"""
+        if sample_seeds is None:
+            return tf.random.normal(tf.shape(reference), dtype=reference.dtype)
+
+        sample_seeds = tf.cast(sample_seeds, tf.int32)
+        sample_shape = tf.shape(reference)[1:]
+
+        def _sample(seed):
+            seed = tf.random.experimental.stateless_fold_in(seed, salt)
+            return tf.random.stateless_normal(
+                sample_shape, seed=seed, dtype=reference.dtype
+            )
+
+        return tf.map_fn(
+            _sample,
+            sample_seeds,
+            fn_output_signature=tf.TensorSpec(
+                shape=reference.shape[1:], dtype=reference.dtype
+            ),
+        )
+
+    @staticmethod
+    def _scale_loss_for_optimizer(loss, optimizer):
+        if hasattr(optimizer, "scale_loss"):
+            return optimizer.scale_loss(loss)
+        return loss
+
     def _to_image(self, logits, src_imgs):
         """logitsを[0,1]レンジの画像に変換する（クリップ前）"""
         output_mode = self.cfg.algorithm[self.cfg.algorithm.name].output_mode
@@ -188,7 +225,7 @@ class BaseI2ITrainer(Model):
 
         # warmup: 主損失が形になる前にDCが支配しないよう線形に立ち上げる
         # （step+1で初回ステップから重みが0にならないようにする）
-        step = ops.cast(self.optimizer.iterations, "float32") + 1.0
+        step = ops.cast(get_optimizer_iterations(self.optimizer), "float32") + 1.0
         warmup = float(max(int(cfg_dc.warmup_steps), 1))
         weight = float(cfg_dc.weight) * ops.minimum(1.0, step / warmup)
         return weight * raw, raw
@@ -235,24 +272,41 @@ class BaseI2ITrainer(Model):
 
     @staticmethod
     def gpu_aug(src_imgs, img_msks, min_clip_vals, max_clip_vals, cfg):
-        # ランダムに正規化中心と幅を変えながら正規化する
-        src_imgs = random_normalize(
-            src_imgs, min_clip_vals, max_clip_vals, **cfg.aug.random_normalize
-        )
-        # ガンマ補正
-        src_imgs = random_gamma_correction(src_imgs, **cfg.aug.random_gamma_correction)
-        # sharpness or gaussian filter
-        src_imgs = apply_random_sharpness_or_gaussian_filter(
-            src_imgs,
-            cfg.aug.random_sharpness.prob,
-            cfg.aug.random_sharpness.sigma,
-            cfg.aug.random_sharpness.alpha_range,
-            cfg.aug.random_gauss_filter.prob,
-            cfg.aug.random_gauss_filter.sigma_range,
-        )
+        cfg_aug = cfg.aug
 
-        # gaussian noise
-        src_imgs = apply_random_gaussian_noise(src_imgs, **cfg.aug.random_gauss_noise)
+        # 無効な拡張はグラフへ入れない。特に3D Gaussian filterはコストが大きい。
+        if float(cfg_aug.random_normalize.prob) > 0.0:
+            src_imgs = random_normalize(
+                src_imgs,
+                min_clip_vals,
+                max_clip_vals,
+                **cfg_aug.random_normalize,
+            )
+        else:
+            src_imgs = normalize(src_imgs, min_clip_vals, max_clip_vals)
+
+        if float(cfg_aug.random_gamma_correction.prob) > 0.0:
+            src_imgs = random_gamma_correction(
+                src_imgs, **cfg_aug.random_gamma_correction
+            )
+
+        if (
+            float(cfg_aug.random_sharpness.prob) > 0.0
+            or float(cfg_aug.random_gauss_filter.prob) > 0.0
+        ):
+            src_imgs = apply_random_sharpness_or_gaussian_filter(
+                src_imgs,
+                cfg_aug.random_sharpness.prob,
+                cfg_aug.random_sharpness.sigma,
+                cfg_aug.random_sharpness.alpha_range,
+                cfg_aug.random_gauss_filter.prob,
+                cfg_aug.random_gauss_filter.sigma_range,
+            )
+
+        if float(cfg_aug.random_gauss_noise.prob) > 0.0:
+            src_imgs = apply_random_gaussian_noise(
+                src_imgs, **cfg_aug.random_gauss_noise
+            )
 
         src_imgs = ops.clip(src_imgs, 0, 1)
         src_imgs = src_imgs * img_msks

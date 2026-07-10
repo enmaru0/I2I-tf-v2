@@ -3,9 +3,30 @@ import tensorflow as tf
 from keras.src import ops
 from tensorflow import GradientTape
 
-from losses import masked_psnr, ssim
+from losses import masked_psnr_per_sample, ssim_per_sample
 
 from .base import BaseI2ITrainer
+
+
+def edm_sigma_schedule(
+    num_steps: int, sigma_min: float, sigma_max: float, rho: float
+) -> list[float]:
+    """EDMのKarras sigma scheduleを返す。末尾の0は最終denoise用。"""
+    num_steps = int(num_steps)
+    if num_steps < 1:
+        raise ValueError("edm.num_stepsは1以上を指定してください")
+    if num_steps == 1:
+        return [float(sigma_max), 0.0]
+    return [
+        (
+            sigma_max ** (1 / rho)
+            + i
+            / (num_steps - 1)
+            * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
+        )
+        ** rho
+        for i in range(num_steps)
+    ] + [0.0]
 
 
 @keras.saving.register_keras_serializable()
@@ -63,7 +84,7 @@ class EDMTrainer(BaseI2ITrainer):
         )
         return loss, denoised
 
-    def _sample(self, src_x, img_msks, num_steps: int):
+    def _sample(self, src_x, img_msks, num_steps: int, sample_seeds=None):
         """
         Karrasスケジュールによる決定的サンプリング。
         solver=heun: 2次Heun（ネットワーク評価は 2*num_steps - 1 回）
@@ -77,16 +98,9 @@ class EDMTrainer(BaseI2ITrainer):
         assert solver in ("euler", "heun"), solver
 
         # σスケジュールはPython floatの定数としてグラフに埋め込む
-        sigmas = [
-            (
-                s_max ** (1 / rho)
-                + i / (num_steps - 1) * (s_min ** (1 / rho) - s_max ** (1 / rho))
-            )
-            ** rho
-            for i in range(num_steps)
-        ] + [0.0]
+        sigmas = edm_sigma_schedule(num_steps, s_min, s_max, rho)
 
-        x = tf.random.normal(tf.shape(src_x)) * sigmas[0]
+        x = self._normal_like(src_x, sample_seeds, salt=100) * sigmas[0]
         for i in range(num_steps):
             s_cur, s_next = sigmas[i], sigmas[i + 1]
             sigma_t = ops.ones_like(x[:, :1, :1, :1, :1]) * s_cur
@@ -112,7 +126,8 @@ class EDMTrainer(BaseI2ITrainer):
 
         with GradientTape() as tape:
             loss, denoised = self._denoise_loss(y, src_x, img_msks, training=True)
-        gradients = tape.gradient(loss, self.generator.trainable_variables)
+            scaled_loss = self._scale_loss_for_optimizer(loss, self.optimizer)
+        gradients = tape.gradient(scaled_loss, self.generator.trainable_variables)
         self.optimizer.apply_gradients(
             zip(gradients, self.generator.trainable_variables)
         )
@@ -121,9 +136,11 @@ class EDMTrainer(BaseI2ITrainer):
         denoised01 = self._to_01(denoised, img_msks)
         self.metrics_dict["total_loss"].update_state(loss)
         self.metrics_dict["psnr"].update_state(
-            masked_psnr(tgt_imgs, denoised01, img_msks)
+            masked_psnr_per_sample(tgt_imgs, denoised01, img_msks)
         )
-        self.metrics_dict["ssim"].update_state(ssim(tgt_imgs, denoised01))
+        self.metrics_dict["ssim"].update_state(
+            ssim_per_sample(tgt_imgs, denoised01, msk=img_msks)
+        )
         return self._get_metrics_result()
 
     def test_step(self, data):
@@ -137,19 +154,33 @@ class EDMTrainer(BaseI2ITrainer):
 
         loss, _ = self._denoise_loss(y, src_x, img_msks, training=False)
 
-        x = self._sample(src_x, img_msks, self._cfg_edm().num_steps_val)
+        x = self._sample(
+            src_x,
+            img_msks,
+            self._cfg_edm().num_steps_val,
+            sample_seeds=self._validation_sample_seeds(data),
+        )
         preds = self._to_01(x, img_msks)
 
         self.metrics_dict["total_loss"].update_state(loss)
-        self.metrics_dict["psnr"].update_state(masked_psnr(tgt_imgs, preds, img_msks))
-        self.metrics_dict["ssim"].update_state(ssim(tgt_imgs, preds))
+        self.metrics_dict["psnr"].update_state(
+            masked_psnr_per_sample(tgt_imgs, preds, img_msks)
+        )
+        self.metrics_dict["ssim"].update_state(
+            ssim_per_sample(tgt_imgs, preds, msk=img_msks)
+        )
         return self._get_metrics_result()
 
     def predict_step(self, data, return_aux=False):
         src_imgs, tgt_imgs, img_msks = self._prepare_batch(data, is_training=False)
         src_x = self._to_x(src_imgs, img_msks)
 
-        x = self._sample(src_x, img_msks, self._cfg_edm().num_steps)
+        x = self._sample(
+            src_x,
+            img_msks,
+            self._cfg_edm().num_steps,
+            sample_seeds=self._validation_sample_seeds(data),
+        )
         preds = self._to_01(x, img_msks)
 
         if return_aux:

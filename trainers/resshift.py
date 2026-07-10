@@ -5,7 +5,7 @@ import tensorflow as tf
 from keras.src import ops
 from tensorflow import GradientTape
 
-from losses import masked_psnr, ssim
+from losses import masked_psnr_per_sample, ssim_per_sample
 
 from .base import BaseI2ITrainer
 
@@ -129,7 +129,7 @@ class ResShiftTrainer(BaseI2ITrainer):
         loss = ops.sum(per_voxel) / (ops.sum(img_msks) + 1e-6)
         return loss, x0_pred
 
-    def _sample(self, src_x, img_msks, num_steps: int):
+    def _sample(self, src_x, img_msks, num_steps: int, sample_seeds=None):
         """
         逆拡散チェーンによるサンプリング（ネットワーク評価はnum_steps回）。
         sample_noise=falseなら決定的（メトリクス評価向き）。
@@ -138,9 +138,8 @@ class ResShiftTrainer(BaseI2ITrainer):
         eta = resshift_eta_schedule(num_steps, cfg.kappa, cfg.schedule_p)
 
         if cfg.sample_noise:
-            x = src_x + cfg.kappa * math.sqrt(eta[num_steps]) * tf.random.normal(
-                tf.shape(src_x)
-            )
+            initial_noise = self._normal_like(src_x, sample_seeds, salt=100)
+            x = src_x + cfg.kappa * math.sqrt(eta[num_steps]) * initial_noise
         else:
             x = src_x
 
@@ -162,7 +161,8 @@ class ResShiftTrainer(BaseI2ITrainer):
             x = (eta_prev / eta_t) * x + (alpha_t / eta_t) * x0_pred
             if cfg.sample_noise and t > 1:
                 sigma = cfg.kappa * math.sqrt((eta_prev / eta_t) * alpha_t)
-                x = x + sigma * tf.random.normal(tf.shape(x))
+                noise = self._normal_like(x, sample_seeds, salt=100 + t)
+                x = x + sigma * noise
         return x
 
     def train_step(self, data):
@@ -176,7 +176,8 @@ class ResShiftTrainer(BaseI2ITrainer):
         with GradientTape() as tape:
             loss, x0_pred = self._denoise_loss(y, src_x, img_msks, training=True)
             loss = self._add_real_dc_loss(loss, data)
-        gradients = tape.gradient(loss, self.generator.trainable_variables)
+            scaled_loss = self._scale_loss_for_optimizer(loss, self.optimizer)
+        gradients = tape.gradient(scaled_loss, self.generator.trainable_variables)
         self.optimizer.apply_gradients(
             zip(gradients, self.generator.trainable_variables)
         )
@@ -184,9 +185,11 @@ class ResShiftTrainer(BaseI2ITrainer):
         x0_pred01 = self._to_01(x0_pred, img_msks)
         self.metrics_dict["total_loss"].update_state(loss)
         self.metrics_dict["psnr"].update_state(
-            masked_psnr(tgt_imgs, x0_pred01, img_msks)
+            masked_psnr_per_sample(tgt_imgs, x0_pred01, img_msks)
         )
-        self.metrics_dict["ssim"].update_state(ssim(tgt_imgs, x0_pred01))
+        self.metrics_dict["ssim"].update_state(
+            ssim_per_sample(tgt_imgs, x0_pred01, msk=img_msks)
+        )
         return self._get_metrics_result()
 
     def test_step(self, data):
@@ -200,19 +203,33 @@ class ResShiftTrainer(BaseI2ITrainer):
 
         loss, _ = self._denoise_loss(y, src_x, img_msks, training=False)
 
-        x = self._sample(src_x, img_msks, self._cfg_rs().num_steps_val)
+        x = self._sample(
+            src_x,
+            img_msks,
+            self._cfg_rs().num_steps_val,
+            sample_seeds=self._validation_sample_seeds(data),
+        )
         preds = self._to_01(x, img_msks)
 
         self.metrics_dict["total_loss"].update_state(loss)
-        self.metrics_dict["psnr"].update_state(masked_psnr(tgt_imgs, preds, img_msks))
-        self.metrics_dict["ssim"].update_state(ssim(tgt_imgs, preds))
+        self.metrics_dict["psnr"].update_state(
+            masked_psnr_per_sample(tgt_imgs, preds, img_msks)
+        )
+        self.metrics_dict["ssim"].update_state(
+            ssim_per_sample(tgt_imgs, preds, msk=img_msks)
+        )
         return self._get_metrics_result()
 
     def predict_step(self, data, return_aux=False):
         src_imgs, tgt_imgs, img_msks = self._prepare_batch(data, is_training=False)
         src_x = self._to_x(src_imgs, img_msks)
 
-        x = self._sample(src_x, img_msks, self._cfg_rs().num_steps)
+        x = self._sample(
+            src_x,
+            img_msks,
+            self._cfg_rs().num_steps,
+            sample_seeds=self._validation_sample_seeds(data),
+        )
         preds = self._to_01(x, img_msks)
 
         if return_aux:

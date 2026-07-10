@@ -1,6 +1,8 @@
 import keras
 import tensorflow as tf
 
+from optimizer_utils import get_optimizer_iterations
+
 
 def _take_slice(vol, axis: str):
     """
@@ -55,7 +57,7 @@ class ImageLogger(keras.callbacks.Callback):
         _, preds, src_imgs, tgt_imgs, _ = self.one_step(self.val_data)
 
         with self.writer.as_default():
-            step = self.model.optimizer.iterations
+            step = get_optimizer_iterations(self.model.optimizer)
             for axis in self.slice_axes:
                 if self.first_log:
                     # sourceとtargetは学習中変わらないので初回のみ記録する

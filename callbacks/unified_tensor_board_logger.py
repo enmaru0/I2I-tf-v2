@@ -2,6 +2,8 @@ import time
 
 import tensorflow as tf
 from keras.api.callbacks import TensorBoard
+
+from optimizer_utils import get_optimizer_iterations
 from keras.src import ops
 
 
@@ -28,7 +30,7 @@ class UnifiedTensorBoardLogger(TensorBoard):
         val_logs = {k: v for k, v in logs.items() if k.startswith("val_")}
         train_logs = self._collect_learning_rate(train_logs)
 
-        step = self.model.optimizer.iterations.numpy()
+        step = get_optimizer_iterations(self.model.optimizer).numpy()
 
         if self.write_steps_per_second:
             train_logs["steps_per_second"] = self._compute_steps_per_second()

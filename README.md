@@ -6,7 +6,7 @@ TensorFlow/Keras 3で学習・比較するプロジェクト。
 
 ## データ形式
 
-`data.mode` で3種類のデータ供給方法を選べる（source/targetは位置合わせ済み＝同一サイズ・同一スペーシングが前提）。
+`data.mode` で4種類のデータ供給方法を選べる（source/targetは位置合わせ済み＝同一サイズ・同一スペーシングが前提）。
 ディレクトリ構成はいずれも `data_dir/{train,val}/<データセット名>/`。
 
 - **paired**（デフォルト）: 同一フォルダに source `xxx.hdr` と target `xxx.target.hdr`
@@ -15,6 +15,8 @@ TensorFlow/Keras 3で学習・比較するプロジェクト。
   **同名ファイル**（`{split}/{データセット名}/{同じ名前}.hdr`）をペアとする
 - **self_noise**: クリーン画像1枚から source=クリーン+合成劣化（ぼかし→ノイズ） / target=クリーン
   を作る自己教師デノイジング（targetファイル不要。`data.self_noise.*` で劣化を設定）
+- **self_sr**: PSFぼかし、低解像度スライス標本化、再補間からthrough-plane SRペアを合成
+  （撮像条件は `data.self_sr.protocols` または範囲指定、スライス位相もランダム化可能）
 
 動作確認用の合成ペアデータは `python utils/make_synthetic_dataset.py` で生成できる。
 
@@ -33,11 +35,14 @@ python main.py --overrides exp_dir=results/pd \
 |---|---|---|---|
 | `regression` | U-Net回帰 (L1/L2/SSIM損失) | 1 forward | ベースライン。residual/direct出力 |
 | `pix2pix` | 条件付きGAN + L1 | 1 forward | 3D PatchGAN。optimizerはadamw推奨 |
-| `edm` | 拡散モデル (Karras 2022) | 2N-1 forwards | Heunサンプラー。EMA未実装 |
+| `edm` | 拡散モデル (Karras 2022) | 2N-1 forwards | Heun/Euler、1 step対応 |
 | `rectified_flow` | Rectified Flow / Flow Matching | N forwards | オイラー積分 |
-| `i2i_rfr` | source起点のRectified Flow再定式化 | N forwards (N=1～4) | source→targetを直接輸送。少ステップ向き |
+| `i2i_rfr` | source起点Rectified Flow | N forwards | source→targetを直接輸送する独自variant |
+| `i2i_rfr_x0` | I2I-RFR x0予測 | N forwards | ノイズ化targetからx0を予測 |
+| `resshift` | Residual Shifting拡散 | N forwards | source近傍から少ステップ復元 |
+| `split_mean_flow` | 区間平均速度場 | N forwards | 1～数ステップ生成 |
 
-生成系（edm / rectified_flow / i2i_rfr）はU-Net入力を3チャンネル
+生成系はU-Net入力を3～4チャンネル
 （作業画像・source・ノイズレベル/時刻の定数チャンネル）にして条件付けする。
 
 ## 使い方
@@ -66,9 +71,19 @@ python eval.py results/reg/checkpoints/model_best.keras
 # 生成系はサンプリングステップ数をスイープして最適値を探せる
 python eval.py results/edm/checkpoints/model_best.keras --num_steps 1,2,4,8,16
 
-# 推論（元画像空間に戻してrawで保存。要pycommonlib）
+# 推論（元画像空間に戻してrawで保存。標準ではsliding-window推論）
 python predict.py results/reg/checkpoints/model_best.keras
+
+# 同一seed・optimizer・step予算で主要手法を比較（時間予算はbudget_mode=minutes）
+python compare_algorithms.py --exp_root results/compare \
+    --algorithms regression i2i_rfr_x0 resshift \
+    --budget_mode steps --budget 100000 --seeds 0 1 2 \
+    --overrides data.mode=self_sr
 ```
+
+比較時は `reproducibility.seed` からcrop・劣化・生成初期ノイズを固定する。評価は症例単位の
+PSNR/MAEとz/y/x方向SSIMを使い、`evaluation.val_patches_per_volume` 個の固定パッチを取る。
+`mixed_precision_policy=mixed_float16` でloss scaling付きmixed precisionを有効化できる。
 
 ## EMA（指数移動平均）
 

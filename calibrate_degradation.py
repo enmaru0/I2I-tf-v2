@@ -18,6 +18,7 @@ TensorFlow不要なのでどの環境でも実行できる。
 
 import argparse
 import math
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -118,6 +119,7 @@ def calibrate_sr(hdr_list, cfg):
     print("\n--- through-plane SR calibration (header spacing) ---")
     axis_counts = {0: 0, 1: 0, 2: 0}
     intervals = []
+    protocol_counts = Counter()
     for hdr_path in hdr_list:
         size_zyx, _dtype, spacing_zyx = read_hdr(hdr_path)
         spacing_zyx = [float(v) for v in spacing_zyx]
@@ -125,6 +127,7 @@ def calibrate_sr(hdr_list, cfg):
         axis_counts[axis] += 1
         interval = spacing_zyx[axis]
         intervals.append(interval)
+        protocol_counts[(axis, round(interval, 1))] += 1
         print(
             f"  {hdr_path.stem}: size={tuple(int(v) for v in size_zyx)} "
             f"spacing={tuple(round(v, 3) for v in spacing_zyx)} "
@@ -148,6 +151,15 @@ def calibrate_sr(hdr_list, cfg):
     print(f"    val_axis: {val_axis}")
     print(f"    val_slice_interval_mm: {med}")
     print(f"    val_slice_thickness_mm: {med}")
+    print("    acquisition_order: 1")
+    print("    random_slice_phase: true")
+    print("    protocols:")
+    for (axis, interval), count in sorted(protocol_counts.items()):
+        weight = count / len(intervals)
+        print(f"      - axis: {AXIS_NAMES[axis]}")
+        print(f"        slice_interval_mm: {interval}")
+        print(f"        slice_thickness_mm: {interval} # 要撮像条件で確認")
+        print(f"        weight: {weight:.4f}")
     print("\n=== --overrides 文字列 ===")
     print(
         f'  "data.self_sr.axes=[{",".join(axes)}]" '

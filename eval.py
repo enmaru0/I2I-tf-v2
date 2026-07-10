@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 import keras
@@ -8,7 +9,7 @@ from absl import logging
 from omegaconf import OmegaConf
 
 from data.dataloader import create_dataloader
-from losses import masked_l1_loss, masked_psnr, ssim
+from losses import masked_l1_per_sample, masked_psnr_per_sample, ssim_per_sample
 from main import gpu_setting, prepare_data_dict
 from trainers import attach_aux_optimizers
 
@@ -17,17 +18,34 @@ GENERATIVE = {"edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0", "resshift", "spl
 
 
 def evaluate_once(model, val_loader, max_batches: int, seed: int):
-    """検証データ全体（最大max_batches）でPSNR/SSIM/MAEを集計する"""
+    """検証データ全体（最大max_batches）で症例単位の指標を集計する"""
     tf.random.set_seed(seed)  # 生成系のサンプリング初期ノイズを揃えて比較可能にする
     psnr_list, ssim_list, mae_list = [], [], []
+    cfg_eval = model.cfg.get("evaluation", {})
+    ssim_axes = tuple(cfg_eval.get("ssim_axes", ["z", "y", "x"]))
+    min_coverage = float(cfg_eval.get("min_slice_mask_coverage", 0.1))
     for i, batch in enumerate(val_loader):
         if max_batches > 0 and i >= max_batches:
             break
         # predict_stepは[0,1]・マスク済みのpreds/tgtを返す
         _, preds, _, tgt_imgs, img_msks = model.predict_step(batch, return_aux=True)
-        psnr_list.append(float(masked_psnr(tgt_imgs, preds, img_msks)))
-        ssim_list.append(float(ssim(tgt_imgs, preds)))
-        mae_list.append(float(masked_l1_loss(tgt_imgs, preds, img_msks)))
+        psnr_list.extend(
+            masked_psnr_per_sample(tgt_imgs, preds, img_msks).numpy().tolist()
+        )
+        ssim_list.extend(
+            ssim_per_sample(
+                tgt_imgs,
+                preds,
+                msk=img_msks,
+                axes=ssim_axes,
+                min_slice_mask_coverage=min_coverage,
+            )
+            .numpy()
+            .tolist()
+        )
+        mae_list.extend(
+            masked_l1_per_sample(tgt_imgs, preds, img_msks).numpy().tolist()
+        )
     return (
         float(np.mean(psnr_list)),
         float(np.mean(ssim_list)),
@@ -58,11 +76,25 @@ if __name__ == "__main__":
         help="評価に使うバッチ数の上限 (0で全バッチ)",
     )
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument(
+        "--output_json",
+        default=None,
+        type=Path,
+        help="指定すると評価結果をJSONでも保存する",
+    )
     args = parser.parse_args()
 
     checkpoint_path: Path = args.checkpoint_path
     cfg = OmegaConf.load(checkpoint_path.parents[1] / "output.yaml")
+    if "reproducibility" not in cfg:
+        cfg.reproducibility = {
+            "seed": args.seed,
+            "fixed_validation_noise": True,
+        }
+    else:
+        cfg.reproducibility.seed = args.seed
     gpu_setting(args.gpu, cfg.gpu_allow_growth)
+    keras.utils.set_random_seed(args.seed)
 
     # 推論を安定させるためeagerで実行する（サンプリングのpythonループ対策）
     tf.config.run_functions_eagerly(True)
@@ -87,7 +119,7 @@ if __name__ == "__main__":
         steps_list = [None]  # 生成系でない場合はnum_stepsは無関係
 
     print(f"\n=== Evaluation: {name} (step {step}) ===")
-    header = f"{'num_steps':>10} | {'PSNR':>7} | {'SSIM':>7} | {'MAE':>7} | {'#batch':>6}"
+    header = f"{'num_steps':>10} | {'PSNR':>7} | {'SSIM':>7} | {'MAE':>7} | {'#case':>6}"
     print(header)
     print("-" * len(header))
     results = []
@@ -105,3 +137,26 @@ if __name__ == "__main__":
     if len(results) > 1:
         best = max(results, key=lambda r: r[1])
         print(f"\nbest num_steps (by PSNR): {best[0]} (PSNR={best[1]:.3f})")
+
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "algorithm": name,
+            "checkpoint": str(checkpoint_path),
+            "checkpoint_step": step,
+            "seed": args.seed,
+            "results": [
+                {
+                    "num_steps": ns,
+                    "psnr": psnr,
+                    "ssim": ssim_v,
+                    "mae": mae,
+                    "num_cases": n,
+                }
+                for ns, psnr, ssim_v, mae, n in results
+            ],
+        }
+        args.output_json.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )

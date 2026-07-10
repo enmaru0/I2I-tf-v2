@@ -3,10 +3,11 @@ import random
 import numpy as np
 
 
-def should_apply_condition(freq, is_training):
+def should_apply_condition(freq, is_training, rng=None):
     if not is_training:
         return False
-    if random.random() < freq:
+    rng = random if rng is None else rng
+    if rng.random() < freq:
         return True
     else:
         return False

@@ -58,13 +58,20 @@ def center_within_image(
 
 
 def random_crop_center_within_bb(
-    bb_zyxzyx, src_size_zyx, dst_size_zyx, src_spacing_zyx, dst_spacing_zyx, margin_zyx
+    bb_zyxzyx,
+    src_size_zyx,
+    dst_size_zyx,
+    src_spacing_zyx,
+    dst_spacing_zyx,
+    margin_zyx,
+    rng=None,
 ):
+    rng = random if rng is None else rng
     bb_zyxzyx = np.array(bb_zyxzyx)
     bb_zyxzyx = add_margin(bb_zyxzyx, src_size_zyx, margin_zyx, src_spacing_zyx)
 
     random_center_zyx = [
-        random.uniform(bb_zyxzyx[axis], bb_zyxzyx[axis + 3]) for axis in range(3)
+        rng.uniform(bb_zyxzyx[axis], bb_zyxzyx[axis + 3]) for axis in range(3)
     ]
 
     center_zyx = center_within_image(

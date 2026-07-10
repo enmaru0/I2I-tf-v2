@@ -93,7 +93,7 @@ class I2IRFRX0Trainer(RectifiedFlowTrainer):
         loss = ops.mean(per_sample * weight)
         return loss, x0_pred
 
-    def _sample(self, src_x, img_msks, num_steps: int):
+    def _sample(self, src_x, img_msks, num_steps: int, sample_seeds=None):
         """
         t=1の純ノイズからt=0への数値積分。速度は v = (x_t - x0_pred) / t。
         solver=euler: 1次オイラー（ネットワーク評価はnum_steps回）
@@ -104,7 +104,7 @@ class I2IRFRX0Trainer(RectifiedFlowTrainer):
         solver = cfg.get("solver", "euler")
         assert solver in ("euler", "heun"), solver
         dt = 1.0 / num_steps
-        x = tf.random.normal(tf.shape(src_x))
+        x = self._normal_like(src_x, sample_seeds, salt=100)
         for n in range(num_steps):
             t_val = max(1.0 - n / num_steps, cfg.t_min)
             t = ops.ones_like(x[:, :1, :1, :1, :1]) * t_val

@@ -21,7 +21,7 @@ from absl import logging
 from omegaconf import OmegaConf
 
 from data.dataloader import create_dataloader
-from losses import masked_psnr, ssim
+from losses import masked_psnr_per_sample, ssim_per_sample
 from main import gpu_setting, prepare_data_dict
 from trainers import attach_aux_optimizers
 
@@ -87,6 +87,13 @@ if __name__ == "__main__":
         ckpt_str, _, ns = entry.partition("@")
         ckpt = Path(ckpt_str)
         cfg = OmegaConf.load(ckpt.parents[1] / "output.yaml")
+        if "reproducibility" not in cfg:
+            cfg.reproducibility = {
+                "seed": args.seed,
+                "fixed_validation_noise": True,
+            }
+        else:
+            cfg.reproducibility.seed = args.seed
         name = cfg.algorithm.name
         model = keras.models.load_model(ckpt, safe_mode=False)
         model.cfg = cfg
@@ -98,6 +105,9 @@ if __name__ == "__main__":
         val_loader = create_dataloader(val_dict, is_training=False, cfg=cfg)
 
         tf.random.set_seed(args.seed)
+        cfg_eval = cfg.get("evaluation", {})
+        ssim_axes = tuple(cfg_eval.get("ssim_axes", ["z", "y", "x"]))
+        min_coverage = float(cfg_eval.get("min_slice_mask_coverage", 0.1))
         psnrs, ssims, lpips_vals, sharp_ratios = [], [], [], []
         for bi, batch in enumerate(val_loader):
             if args.max_batches and bi >= args.max_batches:
@@ -105,8 +115,20 @@ if __name__ == "__main__":
             _, preds, _, tgt, msk = model.predict_step(batch, return_aux=True)
             preds_np, tgt_np, msk_np = preds.numpy(), tgt.numpy(), msk.numpy()
 
-            psnrs.append(float(masked_psnr(tgt, preds, msk)))
-            ssims.append(float(ssim(tgt, preds)))
+            psnrs.extend(
+                masked_psnr_per_sample(tgt, preds, msk).numpy().tolist()
+            )
+            ssims.extend(
+                ssim_per_sample(
+                    tgt,
+                    preds,
+                    msk=msk,
+                    axes=ssim_axes,
+                    min_slice_mask_coverage=min_coverage,
+                )
+                .numpy()
+                .tolist()
+            )
 
             for i in range(preds_np.shape[0]):
                 st = sharpness(tgt_np[i, ..., 0], msk_np[i, ..., 0])

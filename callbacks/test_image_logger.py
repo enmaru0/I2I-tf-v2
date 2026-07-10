@@ -1,6 +1,8 @@
 import keras
 import tensorflow as tf
 
+from optimizer_utils import get_optimizer_iterations
+
 from .image_logger import _take_slice, as_axis_list
 
 
@@ -55,7 +57,7 @@ class TestImageLogger(keras.callbacks.Callback):
         preds = self.one_step(self.test_data)
 
         with self.writer.as_default():
-            step = self.model.optimizer.iterations
+            step = get_optimizer_iterations(self.model.optimizer)
             for i, name in enumerate(self.names):
                 for axis in self.slice_axes:
                     if self.first_log:

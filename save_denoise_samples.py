@@ -1,7 +1,7 @@
 """
 学習済みモデルで検証パッチをデノイズし、
 noisy入力 / denoise結果 / clean正解 をraw画像として保存する。
-predict.pyと違いcommonlib不要（パッチ単位）。目視確認用。
+パッチ単位の推論結果を保存する目視確認用スクリプト。
 
 使い方:
     python save_denoise_samples.py results/mr_denoise_reg/checkpoints/model_best.keras \

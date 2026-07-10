@@ -122,6 +122,7 @@ def _resize_axis0(
         (out_n / vol.shape[0], 1.0, 1.0),
         order=order,
         prefilter=bool(prefilter) and order > 1,
+        mode="nearest",
     )
     if out.shape[0] > out_n:
         start = (out.shape[0] - out_n) // 2
@@ -131,6 +132,56 @@ def _resize_axis0(
         pad_after = out_n - out.shape[0] - pad_before
         out = np.pad(out, ((pad_before, pad_after), (0, 0), (0, 0)), mode="edge")
     return out.astype(np.float32, copy=False)
+
+
+def _sample_axis0(
+    vol: np.ndarray,
+    interval_px: float,
+    phase_px: int = 0,
+    order: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """PSF適用済みvolumeを規則的なスライス中心で標本化する。"""
+    n_axis = int(vol.shape[0])
+    phase_px = int(np.clip(phase_px, 0, max(n_axis - 1, 0)))
+    positions = np.arange(phase_px, n_axis, interval_px, dtype=np.float32)
+    if positions.size == 0:
+        positions = np.array([float(phase_px)], np.float32)
+
+    if int(order) == 0:
+        indices = np.clip(np.rint(positions).astype(np.int64), 0, n_axis - 1)
+        sampled = vol[indices]
+    elif int(order) == 1:
+        lower = np.floor(positions).astype(np.int64)
+        upper = np.minimum(lower + 1, n_axis - 1)
+        weight = (positions - lower).reshape((-1, 1, 1))
+        sampled = (1.0 - weight) * vol[lower] + weight * vol[upper]
+    else:
+        raise ValueError("self_sr.acquisition_orderは0または1を指定してください")
+    return sampled.astype(np.float32, copy=False), positions
+
+
+def _reconstruct_axis0(
+    samples: np.ndarray,
+    positions: np.ndarray,
+    out_n: int,
+    order: int,
+    prefilter: bool,
+) -> np.ndarray:
+    """低解像度スライス列をzoomで密なグリッドへ戻し、観測外は端値で補う。"""
+    out_n = int(out_n)
+    if samples.shape[0] == 1:
+        return np.repeat(samples, out_n, axis=0).astype(np.float32, copy=False)
+
+    start = int(round(float(positions[0])))
+    span_n = max(2, int(round(float(positions[-1] - positions[0]))) + 1)
+    dense = _resize_axis0(samples, span_n, order, prefilter)
+
+    output = np.empty((out_n,) + samples.shape[1:], np.float32)
+    output[:start] = dense[0]
+    copy_end = min(start + span_n, out_n)
+    output[start:copy_end] = dense[: copy_end - start]
+    output[copy_end:] = dense[min(copy_end - start - 1, dense.shape[0] - 1)]
+    return output
 
 
 def simulate_through_plane_sr(
@@ -143,6 +194,8 @@ def simulate_through_plane_sr(
     interpolation_order: int = 1,
     interpolation_prefilter: bool = True,
     continuous_sigma_k: float = CONTINUOUS_SR_SIGMA_FACTOR,
+    acquisition_order: int = 1,
+    slice_phase_px: int = 0,
 ) -> np.ndarray:
     """
     スライス方向の低解像度撮像をシミュレートする（edm-torchの
@@ -151,7 +204,7 @@ def simulate_through_plane_sr(
        - gaussian: FWHM=スライス厚
        - box: 幅=スライス厚
        - continuous: sigma=スライス間隔*k
-    2. スライス間隔に合わせて間引き
+    2. スライス間隔・位相に合わせて低解像度グリッドで標本化
     3. 元グリッドへ補間で戻す（出力サイズは入力と同じ）
     """
     axis_first = np.moveaxis(img.astype(np.float32, copy=False), axis_dim, 0)
@@ -179,50 +232,78 @@ def simulate_through_plane_sr(
         raise NotImplementedError(slice_profile)
 
     n_axis = axis_first.shape[0]
-    low_n = int(round((n_axis - 1) / interval_px)) + 1 if n_axis > 1 else 1
-    low_n = max(1, min(n_axis, low_n))
-    lowres = _resize_axis0(
-        axis_first, low_n, interpolation_order, interpolation_prefilter
+    lowres, positions = _sample_axis0(
+        axis_first,
+        interval_px,
+        phase_px=slice_phase_px,
+        order=acquisition_order,
     )
-    upsampled = _resize_axis0(
-        lowres, n_axis, interpolation_order, interpolation_prefilter
+    upsampled = _reconstruct_axis0(
+        lowres,
+        positions,
+        n_axis,
+        interpolation_order,
+        interpolation_prefilter,
     )
     return np.moveaxis(upsampled, 0, axis_dim).astype(np.float32, copy=False)
 
 
-def apply_random_self_noise(clean: np.ndarray, intensity_range: float, cfg_sn) -> np.ndarray:
+def apply_random_self_noise(
+    clean: np.ndarray, intensity_range: float, cfg_sn, rng=None
+) -> np.ndarray:
     """
     self_noiseの学習時ランダム劣化（モーションブラー→ぼかし→ノイズの順）。
     学習ローダとprobe_sim2real.pyの両方から使う。
     """
+    rng = np.random.default_rng() if rng is None else rng
     degraded = clean.astype(np.float32)
-    if np.random.uniform() < cfg_sn.motion_blur.prob:
-        length = np.random.uniform(*cfg_sn.motion_blur.length_range)
-        direction = np.random.normal(size=3)  # 一様ランダム方向
+    if rng.uniform() < cfg_sn.motion_blur.prob:
+        length = rng.uniform(*cfg_sn.motion_blur.length_range)
+        direction = rng.normal(size=3)  # 一様ランダム方向
         degraded = apply_motion_blur(degraded, direction, length)
-    if np.random.uniform() < cfg_sn.blur_prob:
-        sigma = np.random.uniform(*cfg_sn.blur_sigma_range)
+    if rng.uniform() < cfg_sn.blur_prob:
+        sigma = rng.uniform(*cfg_sn.blur_sigma_range)
         degraded = gaussian_filter(degraded, sigma=sigma)
-    std_rel = np.random.uniform(*cfg_sn.noise_std_rel_range)
-    noise = np.random.normal(0.0, std_rel * intensity_range, degraded.shape)
+    std_rel = rng.uniform(*cfg_sn.noise_std_rel_range)
+    noise = rng.normal(0.0, std_rel * intensity_range, degraded.shape)
     return degraded + noise.astype(np.float32)
 
 
-def apply_random_self_sr(clean: np.ndarray, norm_spacing_zyx, cfg_sr) -> np.ndarray:
+def apply_random_self_sr(
+    clean: np.ndarray, norm_spacing_zyx, cfg_sr, py_rng=None, np_rng=None
+) -> np.ndarray:
     """
     self_srの学習時ランダム劣化（軸・スライス間隔・厚みをサンプリング）。
     学習ローダとprobe_sim2real.pyの両方から使う。
     """
+    py_rng = random if py_rng is None else py_rng
+    np_rng = np.random.default_rng() if np_rng is None else np_rng
     interpolation_order, interpolation_prefilter = _normalize_sr_interpolation(
         cfg_sr.slice_interpolation,
         cfg_sr.get("b_spline_order", 3),
     )
-    axis_name = str(random.choice(list(cfg_sr.axes))).upper()
+    protocols = list(cfg_sr.get("protocols", []))
+    if protocols:
+        weights = [float(protocol.get("weight", 1.0)) for protocol in protocols]
+        protocol = py_rng.choices(protocols, weights=weights, k=1)[0]
+        axis_name = str(protocol.axis).upper()
+        slice_interval_mm = float(protocol.slice_interval_mm)
+        slice_thickness_mm = float(
+            protocol.get("slice_thickness_mm", slice_interval_mm)
+        )
+    else:
+        axis_name = str(py_rng.choice(list(cfg_sr.axes))).upper()
+        slice_interval_mm = np_rng.uniform(*cfg_sr.slice_interval_mm_range)
+        slice_thickness_mm = np_rng.uniform(*cfg_sr.slice_thickness_mm_range)
     axis_dim = SR_AXIS_TO_DIM[axis_name]
-    slice_interval_mm = np.random.uniform(*cfg_sr.slice_interval_mm_range)
-    slice_thickness_mm = np.random.uniform(*cfg_sr.slice_thickness_mm_range)
     if cfg_sr.clamp_thickness_to_interval:
         slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
+    interval_px = max(
+        float(slice_interval_mm) / float(norm_spacing_zyx[axis_dim]), 1.0
+    )
+    phase_px = 0
+    if bool(cfg_sr.get("random_slice_phase", False)):
+        phase_px = int(np_rng.integers(0, max(1, int(np.ceil(interval_px)))))
     return simulate_through_plane_sr(
         clean,
         axis_dim,
@@ -235,6 +316,8 @@ def apply_random_self_sr(clean: np.ndarray, norm_spacing_zyx, cfg_sr) -> np.ndar
         continuous_sigma_k=cfg_sr.get(
             "continuous_sigma_k", CONTINUOUS_SR_SIGMA_FACTOR
         ),
+        acquisition_order=int(cfg_sr.get("acquisition_order", 1)),
+        slice_phase_px=phase_px,
     )
 
 
@@ -272,25 +355,41 @@ def _apply_crop_exclude_start_slices(box_zyxzyx, img_size_zyx, cfg_aug):
 
 
 def get_crop_center(
-    img_hdr_path: Path, img_size_zyx, spacing_zyx, is_training: bool, cfg
+    img_hdr_path: Path,
+    img_size_zyx,
+    spacing_zyx,
+    is_training: bool,
+    cfg,
+    rng=None,
+    validation_patch_index: int = 0,
+    validation_patch_count: int = 1,
 ):
     """クロップ中心を決める。検証時は画像中心、学習時はランダム"""
     crop_size_zyx = cfg.aug.crop_size_zyx
     norm_spacing_zyx = cfg.aug.affine.norm_spacing_zyx
 
     if not is_training:
-        # 画像中心（クロップが画像内に収まるように調整）
+        center = np.array(img_size_zyx, dtype=np.float32) / 2.0
+        if validation_patch_count > 1:
+            z_min = float(cfg.aug.get("crop_exclude_start_slices", 0))
+            z_max = float(img_size_zyx[0])
+            fraction = (validation_patch_index + 1.0) / (
+                validation_patch_count + 1.0
+            )
+            center[0] = z_min + fraction * max(z_max - z_min, 0.0)
+        # 固定位置（クロップが画像内に収まるように調整）
         return center_within_image(
-            np.array(img_size_zyx) / 2,
+            center,
             img_size_zyx,
             crop_size_zyx,
             spacing_zyx,
             norm_spacing_zyx,
         )
 
+    rng = random if rng is None else rng
     mode_list = list(cfg.aug.random_crop_method.keys())
     weight = list(cfg.aug.random_crop_method.values())
-    mode = random.choices(mode_list, weight, k=1)[0]
+    mode = rng.choices(mode_list, weight, k=1)[0]
 
     if mode == "body":
         # 体表マスクの矩形内でランダムクロップ（.body.box.txtはsave_organ_boxで作成）
@@ -312,15 +411,29 @@ def get_crop_center(
         spacing_zyx,
         norm_spacing_zyx,
         [0, 0, 0],
+        rng=rng,
     )
 
 
 def preprocess_image_np(
-    img_hdr_list_with_data_name: list[bytes], is_training: bool, cfg
+    img_hdr_list_with_data_name: list[bytes],
+    sample_index: int,
+    is_training: bool,
+    cfg,
 ):
     src_hdr_path, dataname = img_hdr_list_with_data_name
-    dataname = dataname.decode()  # noqa: F841 データセットごとに処理を変える場合に使う
+    dataname = dataname.decode()
     src_hdr_path = Path(src_hdr_path.decode())
+
+    cfg_repro = cfg.get("reproducibility", {})
+    base_seed = int(cfg_repro.get("seed", 0))
+    path_seed = zlib.crc32(f"{dataname}:{src_hdr_path}".encode())
+    sample_seed = (base_seed + path_seed + int(sample_index) * 0x9E3779B1) & 0xFFFFFFFF
+    py_rng = random.Random(sample_seed)
+    np_rng = np.random.default_rng(sample_seed)
+    cfg_eval = cfg.get("evaluation", {})
+    val_patch_count = max(1, int(cfg_eval.get("val_patches_per_volume", 1)))
+    val_patch_index = 0 if is_training else int(sample_index) % val_patch_count
 
     # self_noiseモード: クリーン画像を1枚だけ読み込み、targetはクリーン、
     #   sourceはクリーン+合成ノイズとする（自己教師デノイジング）
@@ -349,7 +462,14 @@ def preprocess_image_np(
 
     # クロップ中心を決める
     crop_center_zyx = get_crop_center(
-        src_hdr_path, img_size_zyx, spacing_zyx, is_training, cfg
+        src_hdr_path,
+        img_size_zyx,
+        spacing_zyx,
+        is_training,
+        cfg,
+        rng=py_rng,
+        validation_patch_index=val_patch_index,
+        validation_patch_count=val_patch_count,
     )
 
     # アフィン変換のためのインスタンスを作成
@@ -357,7 +477,7 @@ def preprocess_image_np(
 
     # アフィン行列を計算（source/targetで同一の行列を使うのが最重要ポイント）
     affine_matrix = affine_transform.get_affine(
-        spacing_zyx, crop_center_zyx, is_training
+        spacing_zyx, crop_center_zyx, is_training, rng=py_rng
     )
 
     # 必要な画像領域を計算
@@ -395,7 +515,7 @@ def preprocess_image_np(
         intensity_range = float(src_max_val - src_min_val)
         if is_training:
             # 学習時は劣化をランダムに適用（probe_sim2real.pyと共通の関数）
-            src_img = apply_random_self_noise(clean, intensity_range, cfg_sn)
+            src_img = apply_random_self_noise(clean, intensity_range, cfg_sn, rng=np_rng)
         else:
             degraded = clean.astype(np.float32)
             # 検証はエポック間・実行間で再現するようファイル名でシードを固定する
@@ -424,7 +544,9 @@ def preprocess_image_np(
         norm_spacing_zyx = cfg.aug.affine.norm_spacing_zyx
         if is_training:
             # 学習時は劣化をランダムに適用（probe_sim2real.pyと共通の関数）
-            src_img = apply_random_self_sr(clean, norm_spacing_zyx, cfg_sr)
+            src_img = apply_random_self_sr(
+                clean, norm_spacing_zyx, cfg_sr, py_rng=py_rng, np_rng=np_rng
+            )
         else:
             # 検証は固定の劣化（軸・間隔・厚みとも決定的で再現可能）
             axis_dim = SR_AXIS_TO_DIM[str(cfg_sr.val_axis).upper()]
@@ -448,6 +570,8 @@ def preprocess_image_np(
                 continuous_sigma_k=cfg_sr.get(
                     "continuous_sigma_k", CONTINUOUS_SR_SIGMA_FACTOR
                 ),
+                acquisition_order=int(cfg_sr.get("acquisition_order", 1)),
+                slice_phase_px=int(cfg_sr.get("val_slice_phase_px", 0)),
             )
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     else:
@@ -470,6 +594,7 @@ def preprocess_image_np(
             is_training=is_training,
             spacing_max_val=2,
             thickness_range=[2, 6],
+            rng=py_rng,
         )
 
         # sourceをアフィン変換：thin->thick変換用にcrop_sizeを大きくしておく
@@ -495,8 +620,8 @@ def preprocess_image_np(
             tgt_min_val, tgt_max_val = get_clip_vals(tgt_hdr_path, cfg)
 
     # チャンネルの次元を追加
-    src_img = add_channel_dim(src_img.astype(np.int16, copy=False))
-    tgt_img = add_channel_dim(tgt_img.astype(np.int16, copy=False))
+    src_img = add_channel_dim(src_img.astype(np.float32, copy=False))
+    tgt_img = add_channel_dim(tgt_img.astype(np.float32, copy=False))
     img_msk = add_channel_dim(img_msk)
     return (
         src_img,
@@ -506,13 +631,19 @@ def preprocess_image_np(
         np.array(src_max_val, np.float32),
         np.array(tgt_min_val, np.float32),
         np.array(tgt_max_val, np.float32),
-        str(src_hdr_path.stem).encode(),
+        (
+            str(src_hdr_path.stem)
+            if is_training or val_patch_count == 1
+            else f"{src_hdr_path.stem}#p{val_patch_index}"
+        ).encode(),
     )
 
 
-def preprocess_image(img_hdr_path_with_data_name, is_training: bool, cfg):
-    def _preprocess_image_np(img_hdr_path_with_data_name):
-        return preprocess_image_np(img_hdr_path_with_data_name, is_training, cfg)
+def preprocess_image(img_hdr_path_with_data_name, sample_index, is_training: bool, cfg):
+    def _preprocess_image_np(img_hdr_path_with_data_name, sample_index):
+        return preprocess_image_np(
+            img_hdr_path_with_data_name, sample_index, is_training, cfg
+        )
 
     (
         src_img,
@@ -525,10 +656,10 @@ def preprocess_image(img_hdr_path_with_data_name, is_training: bool, cfg):
         img_hdr,
     ) = tf.numpy_function(
         func=_preprocess_image_np,
-        inp=[img_hdr_path_with_data_name],
+        inp=[img_hdr_path_with_data_name, sample_index],
         Tout=[
-            tf.int16,
-            tf.int16,
+            tf.float32,
+            tf.float32,
             tf.uint8,
             tf.float32,
             tf.float32,
@@ -577,6 +708,21 @@ def make_batch_dict(
     https://www.tensorflow.org/guide/data_performance_analysis?hl=ja#3_cpu_%E4%BD%BF%E7%94%A8%E7%8E%87%E3%81%8C%E9%AB%98%E3%81%8F%E3%81%AA%E3%81%A3%E3%81%A6%E3%81%84%E3%82%8B%E3%81%8B%EF%BC%9F
     """
 
+    cfg_repro = cfg.get("reproducibility", {})
+    base_seed = int(cfg_repro.get("seed", 0))
+    id_hash = tf.strings.to_hash_bucket_strong(
+        img_hdr_list,
+        num_buckets=2**31 - 1,
+        key=[0x13579BDF, 0x2468ACE0],
+    )
+    sample_seeds = tf.stack(
+        [
+            tf.fill(tf.shape(id_hash), tf.cast(base_seed, tf.int64)),
+            id_hash,
+        ],
+        axis=-1,
+    )
+
     data = dict(
         src_imgs=tf.cast(src_imgs, tf.float32),
         tgt_imgs=tf.cast(tgt_imgs, tf.float32),
@@ -585,6 +731,8 @@ def make_batch_dict(
         src_max_clip_vals=src_max_clip_vals,
         tgt_min_clip_vals=tgt_min_clip_vals,
         tgt_max_clip_vals=tgt_max_clip_vals,
+        img_ids=img_hdr_list,
+        sample_seeds=tf.cast(sample_seeds, tf.int32),
     )
     if cfg.debug_dataloader:
         data["img_hdr_list"] = img_hdr_list
@@ -650,12 +798,20 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
                 ]
                 _run(func, tgt_hdr_path_list, "saving target intensity")
 
+    cfg_repro = cfg.get("reproducibility", {})
+    data_seed = int(cfg_repro.get("seed", 0))
     dataset_list = []
     frequency_list = []
     for data_name, value in img_hdr_dict.items():
         # データセットごとに処理を変えることを想定してデータセット名を付与する（処理はpreprocess_image_npで実装）
+        repeat_count = 1
+        if not is_training:
+            cfg_eval = cfg.get("evaluation", {})
+            repeat_count = max(1, int(cfg_eval.get("val_patches_per_volume", 1)))
         img_hdr_list_with_data_name = [
-            (str(path), data_name) for path in sorted(value["img_hdr_list"])
+            (str(path), data_name)
+            for path in sorted(value["img_hdr_list"])
+            for _ in range(repeat_count)
         ]
         _dataset = tf.data.Dataset.from_tensor_slices(img_hdr_list_with_data_name)
 
@@ -669,20 +825,42 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
     # データセットを結合する。学習時はここでサンプリングの重みを設定する。
     if is_training:
         dataset = tf.data.Dataset.sample_from_datasets(
-            dataset_list, weights=frequency_list
+            dataset_list, weights=frequency_list, seed=data_seed
         )
     else:
-        dataset = tf.data.Dataset.sample_from_datasets(dataset_list)
+        dataset = dataset_list[0]
+        for next_dataset in dataset_list[1:]:
+            dataset = dataset.concatenate(next_dataset)
 
     if is_training:
-        dataset = dataset.shuffle(buffer_size=len(img_hdr_path_list))
+        dataset = dataset.shuffle(
+            buffer_size=len(img_hdr_path_list),
+            seed=data_seed,
+            reshuffle_each_iteration=True,
+        )
 
-    def _preprocess_image(img_hdr_path_with_data_name):
-        return preprocess_image(img_hdr_path_with_data_name, is_training, cfg)
+    dataset = dataset.enumerate()
+
+    def _preprocess_image(sample_index, img_hdr_path_with_data_name):
+        return preprocess_image(
+            img_hdr_path_with_data_name, sample_index, is_training, cfg
+        )
 
     dataset = dataset.map(
         _preprocess_image, num_parallel_calls=cfg.num_workers
     )  # autotuneはなんか遅かった・・・
+
+    if not is_training:
+        cfg_eval = cfg.get("evaluation", {})
+        cache_setting = str(cfg_eval.get("validation_cache", ""))
+        if cache_setting == "memory":
+            dataset = dataset.cache()
+        elif cache_setting:
+            cache_path = Path(cache_setting)
+            if not cache_path.is_absolute():
+                cache_path = Path(cfg.exp_dir) / cache_path
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            dataset = dataset.cache(str(cache_path))
 
     # 学習はjit+サンプリングの都合でdrop_remainder=True。
     # 検証はdrop_remainder=Falseにして、val症例数 < batch_sizeでも
@@ -708,7 +886,7 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
     return dataset
 
 
-def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
+def preprocess_real_dc_image_np(hdr_path_bytes, sample_index, cfg):
     """
     DC損失用の実劣化画像を読み込む。
     - ランダム中心クロップ + norm_spacingへのリサンプル
@@ -721,6 +899,11 @@ def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
     """
     cfg_dc = cfg.data.real_dc
     hdr_path = Path(hdr_path_bytes.decode())
+    cfg_repro = cfg.get("reproducibility", {})
+    base_seed = int(cfg_repro.get("seed", 0))
+    path_seed = zlib.crc32(str(hdr_path).encode())
+    sample_seed = (base_seed + path_seed + int(sample_index) * 0x9E3779B1) & 0xFFFFFFFF
+    py_rng = random.Random(sample_seed)
     img_interp_order = int(cfg.aug.image_interpolation_order)
     crop_size_zyx = cfg.aug.crop_size_zyx
     img_size_zyx, img_dtype, spacing_zyx = read_hdr(hdr_path)
@@ -751,6 +934,7 @@ def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
         spacing_zyx,
         cfg.aug.affine.norm_spacing_zyx,
         [0, 0, 0],
+        rng=py_rng,
     )
     affine_transform = AffineTransform(crop_size_zyx=crop_size_zyx, **cfg.aug.affine)
     affine_matrix = affine_transform.get_affine(
@@ -774,7 +958,7 @@ def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
     img = affine_transform.apply(img, affine_matrix, order=img_interp_order)
 
     return (
-        add_channel_dim(img.astype(np.int16, copy=False)),
+        add_channel_dim(img.astype(np.float32, copy=False)),
         add_channel_dim(img_msk),
         np.array(min_val, np.float32),
         np.array(max_val, np.float32),
@@ -802,14 +986,14 @@ def _make_real_dc_dataset(cfg):
                 max_percentile=cfg.image.MR.max_percentile,
             )
 
-    def _preprocess(hdr_path_bytes):
-        def _np_func(hdr_path_bytes):
-            return preprocess_real_dc_image_np(hdr_path_bytes, cfg)
+    def _preprocess(sample_index, hdr_path_bytes):
+        def _np_func(hdr_path_bytes, sample_index):
+            return preprocess_real_dc_image_np(hdr_path_bytes, sample_index, cfg)
 
         img, msk, min_val, max_val, sigma_px = tf.numpy_function(
             func=_np_func,
-            inp=[hdr_path_bytes],
-            Tout=[tf.int16, tf.uint8, tf.float32, tf.float32, tf.float32],
+            inp=[hdr_path_bytes, sample_index],
+            Tout=[tf.float32, tf.uint8, tf.float32, tf.float32, tf.float32],
         )
         img_shape = tuple(cfg.aug.crop_size_zyx) + (1,)
         img.set_shape(img_shape)
@@ -819,8 +1003,11 @@ def _make_real_dc_dataset(cfg):
         sigma_px.set_shape(())
         return img, msk, min_val, max_val, sigma_px
 
+    cfg_repro = cfg.get("reproducibility", {})
+    data_seed = int(cfg_repro.get("seed", 0))
     dataset = tf.data.Dataset.from_tensor_slices([str(p) for p in hdr_list])
-    dataset = dataset.repeat().shuffle(buffer_size=len(hdr_list))
+    dataset = dataset.repeat().shuffle(buffer_size=len(hdr_list), seed=data_seed)
+    dataset = dataset.enumerate()
     dataset = dataset.map(_preprocess, num_parallel_calls=cfg.num_workers)
     dataset = dataset.batch(cfg.batch_size, drop_remainder=True)
 
@@ -927,5 +1114,20 @@ def create_test_batch(cfg):
         img_msks=tf.constant(np.stack(msks), tf.float32),
         src_min_clip_vals=tf.constant(np.stack(min_vals), tf.float32),
         src_max_clip_vals=tf.constant(np.stack(max_vals), tf.float32),
+    )
+    cfg_repro = cfg.get("reproducibility", {})
+    base_seed = int(cfg_repro.get("seed", 0))
+    name_tensor = tf.constant(names, tf.string)
+    id_hash = tf.strings.to_hash_bucket_strong(
+        name_tensor,
+        num_buckets=2**31 - 1,
+        key=[0x13579BDF, 0x2468ACE0],
+    )
+    data["sample_seeds"] = tf.cast(
+        tf.stack(
+            [tf.fill(tf.shape(id_hash), tf.cast(base_seed, tf.int64)), id_hash],
+            axis=-1,
+        ),
+        tf.int32,
     )
     return data, names

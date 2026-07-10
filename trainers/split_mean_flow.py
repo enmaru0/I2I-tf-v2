@@ -102,10 +102,10 @@ class SplitMeanFlowTrainer(RectifiedFlowTrainer):
         x1_hat = x_t + (1.0 - t) * u_full
         return loss, x1_hat
 
-    def _sample(self, src_x, img_msks, num_steps: int):
+    def _sample(self, src_x, img_msks, num_steps: int, sample_seeds=None):
         """平均速度場による等間隔ジャンプ（ネットワーク評価はnum_steps回、1でも可）"""
         dt = 1.0 / num_steps
-        x = self._initial_state(src_x)
+        x = self._initial_state(src_x, sample_seeds=sample_seeds, salt=100)
         for i in range(num_steps):
             t = ops.ones_like(x[:, :1, :1, :1, :1]) * (i * dt)
             s = ops.ones_like(x[:, :1, :1, :1, :1]) * ((i + 1) * dt)

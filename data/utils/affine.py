@@ -75,6 +75,7 @@ class AffineTransform:
         is_training: bool,
         return_random_var: bool = False,
         random_var: dict = {},
+        rng=None,
     ) -> np.ndarray | tuple[np.ndarray, dict]:
         """
         パラメータに基づいてアフィン変換行列を生成します。
@@ -113,17 +114,18 @@ class AffineTransform:
 
         # ランダムにスケーリングを変える
         random_scale = random_var.get(
-            "random_scale", random_scaling(self.scaling_range_zyx, is_training)
+            "random_scale", random_scaling(self.scaling_range_zyx, is_training, rng=rng)
         )
 
         # ランダムに軸を反転する
         random_flip = random_var.get(
-            "random_flip", random_flipping(self.random_flip_axis_zyx, is_training)
+            "random_flip",
+            random_flipping(self.random_flip_axis_zyx, is_training, rng=rng),
         )
 
         # ランダムに回転する
         random_rotate = random_var.get(
-            "random_rotate", random_rotation(self.random_rot_deg_zyx, is_training)
+            "random_rotate", random_rotation(self.random_rot_deg_zyx, is_training, rng=rng)
         )
 
         # 画像中心を戻す
@@ -133,7 +135,10 @@ class AffineTransform:
         random_shift = random_var.get(
             "random_shift",
             random_translation(
-                self.random_shift_rate_zyx, self.crop_size_zyx, is_training
+                self.random_shift_rate_zyx,
+                self.crop_size_zyx,
+                is_training,
+                rng=rng,
             ),
         )
 
@@ -271,9 +276,11 @@ class AffineTransform:
         return two_point_extractor(bbs)
 
     def transform_array(self, array, affine_matrix, order, cval, output_shape):
+        output_dtype = np.float32 if int(order) > 0 else array.dtype
         return affine_transform(
             array,
             affine_matrix,
+            output=output_dtype,
             order=order,
             mode="constant",
             cval=cval,
@@ -282,8 +289,9 @@ class AffineTransform:
         )
 
     def transform_array_batch(self, batch, affine_matrix, order, cval, output_shape):
+        output_dtype = np.float32 if int(order) > 0 else batch.dtype
         transformed_batch = np.zeros(
-            list(output_shape) + [batch.shape[-1]], batch.dtype
+            list(output_shape) + [batch.shape[-1]], output_dtype
         )
         for i in range(batch.shape[-1]):
             transformed_batch[..., i] = self.transform_array(

@@ -46,11 +46,14 @@ def attach_aux_optimizers(trainer: BaseI2ITrainer, cfg) -> None:
     """
     if cfg.algorithm.name == "pix2pix":
         cfg_d = cfg.algorithm.pix2pix.d_optimizer
-        trainer.d_optimizer = keras.optimizers.Adam(
+        d_optimizer = keras.optimizers.Adam(
             learning_rate=cfg_d.lr,
             beta_1=cfg_d.beta_1,
             clipvalue=cfg_d.clip_value,
         )
+        if keras.mixed_precision.global_policy().name == "mixed_float16":
+            d_optimizer = keras.mixed_precision.LossScaleOptimizer(d_optimizer)
+        trainer.d_optimizer = d_optimizer
 
 
 def build_trainer(cfg, input_shape) -> BaseI2ITrainer:

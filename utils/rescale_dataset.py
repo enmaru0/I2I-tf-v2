@@ -1,52 +1,32 @@
 import argparse
 import multiprocessing
+import sys
 from functools import partial
 from pathlib import Path
 
-import commonlib
 import numpy as np
 from irg import read_hdr, read_raw, read_re4, save_raw, save_re4
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from inference_utils import resize_volume_to_shape
+
 
 def rescale_cpp_img(data_np, src_spacing, dst_spacing):
-    scale_zyx = src_spacing / dst_spacing
-    img_filter_z = commonlib.ImageFilter.ANTIALIASING(scale_zyx[0])
-    img_filter_y = commonlib.ImageFilter.ANTIALIASING(scale_zyx[1])
-    img_filter_x = commonlib.ImageFilter.ANTIALIASING(scale_zyx[2])
-
-    rescaled_transform = commonlib.RescaleTransform3DWithFilter(
-        img_filter_z,
-        img_filter_y,
-        img_filter_x,
-        commonlib.ImageFilter.DEFAULT_OUT(np.int16),
-        commonlib.ImageFilter.DEFAULT_IN,
-        commonlib.ImageFilter.ZERO_OVER,
-    )
-    rescaled_transform.SetOrgImageSize(*data_np.shape[::-1])
-    rescaled_transform.SetScale(*scale_zyx[::-1])
-
-    rescaled_transform.SetOrgImage(data_np)
-    out = rescaled_transform.Transform()
-    return out
+    scale_zyx = np.asarray(src_spacing) / np.asarray(dst_spacing)
+    out_size = np.round(np.asarray(data_np.shape) * scale_zyx).astype(int)
+    return resize_volume_to_shape(
+        data_np, out_size, order=3, anti_alias=True
+    ).astype(np.int16)
 
 
 def rescale_cpp_msk(data_np, src_spacing, dst_spacing):
-    img_filter = commonlib.ImageFilter.NN
-    scale_zyx = src_spacing / dst_spacing
-    rescaled_transform = commonlib.RescaleTransform3DWithFilter(
-        img_filter,
-        img_filter,
-        img_filter,
-        commonlib.ImageFilter.DEFAULT_OUT(np.uint16),
-        commonlib.ImageFilter.DEFAULT_IN,
-        commonlib.ImageFilter.ZERO_OVER,
-    )
-    rescaled_transform.SetOrgImageSize(*data_np.shape[::-1])
-    rescaled_transform.SetScale(*scale_zyx[::-1])
-    rescaled_transform.SetOrgImage(data_np)
-    return rescaled_transform.Transform()
+    scale_zyx = np.asarray(src_spacing) / np.asarray(dst_spacing)
+    out_size = np.round(np.asarray(data_np.shape) * scale_zyx).astype(int)
+    return resize_volume_to_shape(
+        data_np, out_size, order=0, anti_alias=False
+    ).astype(np.uint16)
 
 
 def rescale(img_hdr_path: Path, img_root: Path, save_root: Path, target_scale_zyx):

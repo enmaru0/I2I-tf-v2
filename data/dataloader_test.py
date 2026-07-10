@@ -1,35 +1,13 @@
 from pathlib import Path
 
-import commonlib
 import numpy as np
 import tensorflow as tf
 from absl import logging
 from irg import read_hdr, read_raw
 
+from inference_utils import resize_volume_to_shape
 from .dataloader import get_clip_vals, resolve_target_hdr_path
 from .utils import add_channel_dim, add_margin, get_pad_for_margin
-
-
-def rescale_cpp_img_with_out_size(data_np, src_spacing, dst_spacing, out_size):
-    rate_zyx = src_spacing / dst_spacing
-    img_filter_z = commonlib.ImageFilter.ANTIALIASING(rate_zyx[0])
-    img_filter_y = commonlib.ImageFilter.ANTIALIASING(rate_zyx[1])
-    img_filter_x = commonlib.ImageFilter.ANTIALIASING(rate_zyx[2])
-
-    rescaled_transform = commonlib.RescaleTransform3DWithFilter(
-        img_filter_z,
-        img_filter_y,
-        img_filter_x,
-        commonlib.ImageFilter.DEFAULT_OUT(np.int16),
-        commonlib.ImageFilter.DEFAULT_IN,
-        commonlib.ImageFilter.ZERO_OVER,
-    )
-
-    rescaled_transform.SetOrgImageSize(*data_np.shape[::-1])
-    rescaled_transform.SetResultImageSize(*out_size[::-1])
-    rescaled_transform.SetOrgImage(data_np)
-    out = rescaled_transform.Transform()
-    return out
 
 
 def preprocess_image_np_test(img_hdr_list_with_data_name: list[bytes], cfg):
@@ -65,12 +43,15 @@ def preprocess_image_np_test(img_hdr_list_with_data_name: list[bytes], cfg):
     crop_zyxzyx = crop_zyxzyx.astype(np.int32)
 
     img = read_raw(src_hdr_path, clip_zyxzyx=crop_zyxzyx)
-    img = rescale_cpp_img_with_out_size(
-        img, spacing_zyx, target_spacing_zyx, resize_zyx
+    img = resize_volume_to_shape(
+        img,
+        resize_zyx,
+        order=int(cfg.aug.image_interpolation_order),
+        anti_alias=True,
     )
 
     src_min_val, src_max_val = get_clip_vals(src_hdr_path, cfg)
-    tgt_hdr_path = resolve_target_hdr_path(src_hdr_path, cfg.data.target_suffix)
+    tgt_hdr_path = resolve_target_hdr_path(src_hdr_path, cfg)
     if cfg.image.share_normalization or not tgt_hdr_path.exists():
         # 推論対象にtargetが存在しない場合もsourceの正規化値で出力を復元する
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
@@ -101,7 +82,7 @@ def preprocess_image_test(img_hdr_path_with_data_name, cfg):
         func=_preprocess_image_np,
         inp=[img_hdr_path_with_data_name],
         Tout=[
-            tf.int16,  # img
+            tf.float32,  # img
             tf.int32,  # crop_zyxzyx
             tf.float32,  # spacing_zyx
             tf.uint32,  # img_size_zyx

@@ -79,6 +79,7 @@ def decoder_last(
         use_bias=True,
         name=f"dec0_conv{num_decode_blocks - 1}",
         kernel_initializer="he_uniform",
+        dtype="float32",
     )(x)
     return x
 

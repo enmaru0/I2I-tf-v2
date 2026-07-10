@@ -3,7 +3,7 @@ import tensorflow as tf
 from keras.src import ops
 from tensorflow import GradientTape
 
-from losses import masked_psnr, ssim
+from losses import masked_psnr_per_sample, ssim_per_sample
 
 from .base import BaseI2ITrainer
 
@@ -28,13 +28,13 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
     def _cfg_rf(self):
         return self.cfg.algorithm.rectified_flow
 
-    def _initial_state(self, src_x):
+    def _initial_state(self, src_x, sample_seeds=None, salt: int = 0):
         """
         フローの出発点x0を返す。標準のrectified flowは純粋ノイズ。
         I2I-RFRなどのサブクラスでオーバーライドする。
         学習時のx0とサンプリングの初期値の両方に使われる。
         """
-        return tf.random.normal(tf.shape(src_x))
+        return self._normal_like(src_x, sample_seeds, salt=salt)
 
     def _velocity(self, x_t, t, src_x, img_msks, training):
         """速度場 v(x_t, t | source) を予測する。tは(b,1,1,1,1)"""
@@ -77,7 +77,7 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
         x1_hat = x_t + (1.0 - t) * v_pred
         return loss, x1_hat
 
-    def _sample(self, src_x, img_msks, num_steps: int):
+    def _sample(self, src_x, img_msks, num_steps: int, sample_seeds=None):
         """
         t=0からt=1への数値積分によるサンプリング。
         solver=euler: 1次オイラー（ネットワーク評価はnum_steps回）
@@ -87,7 +87,7 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
         solver = self._cfg_rf().get("solver", "euler")
         assert solver in ("euler", "heun"), solver
         dt = 1.0 / num_steps
-        x = self._initial_state(src_x)
+        x = self._initial_state(src_x, sample_seeds=sample_seeds, salt=100)
         for i in range(num_steps):
             t = ops.ones_like(x[:, :1, :1, :1, :1]) * (i * dt)
             v = self._velocity(x, t, src_x, img_msks, training=False)
@@ -120,7 +120,8 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
         with GradientTape() as tape:
             loss, x1_hat = self._flow_loss(y, src_x, img_msks, training=True)
             loss = self._add_real_dc_loss(loss, data)
-        gradients = tape.gradient(loss, self.generator.trainable_variables)
+            scaled_loss = self._scale_loss_for_optimizer(loss, self.optimizer)
+        gradients = tape.gradient(scaled_loss, self.generator.trainable_variables)
         self.optimizer.apply_gradients(
             zip(gradients, self.generator.trainable_variables)
         )
@@ -128,9 +129,11 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
         x1_hat01 = self._to_01(x1_hat, img_msks)
         self.metrics_dict["total_loss"].update_state(loss)
         self.metrics_dict["psnr"].update_state(
-            masked_psnr(tgt_imgs, x1_hat01, img_msks)
+            masked_psnr_per_sample(tgt_imgs, x1_hat01, img_msks)
         )
-        self.metrics_dict["ssim"].update_state(ssim(tgt_imgs, x1_hat01))
+        self.metrics_dict["ssim"].update_state(
+            ssim_per_sample(tgt_imgs, x1_hat01, msk=img_msks)
+        )
         return self._get_metrics_result()
 
     def test_step(self, data):
@@ -144,19 +147,33 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
 
         loss, _ = self._flow_loss(y, src_x, img_msks, training=False)
 
-        x = self._sample(src_x, img_msks, self._cfg_rf().num_steps_val)
+        x = self._sample(
+            src_x,
+            img_msks,
+            self._cfg_rf().num_steps_val,
+            sample_seeds=self._validation_sample_seeds(data),
+        )
         preds = self._to_01(x, img_msks)
 
         self.metrics_dict["total_loss"].update_state(loss)
-        self.metrics_dict["psnr"].update_state(masked_psnr(tgt_imgs, preds, img_msks))
-        self.metrics_dict["ssim"].update_state(ssim(tgt_imgs, preds))
+        self.metrics_dict["psnr"].update_state(
+            masked_psnr_per_sample(tgt_imgs, preds, img_msks)
+        )
+        self.metrics_dict["ssim"].update_state(
+            ssim_per_sample(tgt_imgs, preds, msk=img_msks)
+        )
         return self._get_metrics_result()
 
     def predict_step(self, data, return_aux=False):
         src_imgs, tgt_imgs, img_msks = self._prepare_batch(data, is_training=False)
         src_x = self._to_x(src_imgs, img_msks)
 
-        x = self._sample(src_x, img_msks, self._cfg_rf().num_steps)
+        x = self._sample(
+            src_x,
+            img_msks,
+            self._cfg_rf().num_steps,
+            sample_seeds=self._validation_sample_seeds(data),
+        )
         preds = self._to_01(x, img_msks)
 
         if return_aux:

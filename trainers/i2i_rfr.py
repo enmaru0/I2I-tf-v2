@@ -1,5 +1,4 @@
 import keras
-import tensorflow as tf
 
 from .rectified_flow import RectifiedFlowTrainer
 
@@ -28,8 +27,9 @@ class I2IRFRTrainer(RectifiedFlowTrainer):
     def _cfg_rf(self):
         return self.cfg.algorithm.i2i_rfr
 
-    def _initial_state(self, src_x):
+    def _initial_state(self, src_x, sample_seeds=None, salt: int = 0):
         noise_std = self._cfg_rf().noise_std
         if noise_std > 0:
-            return src_x + noise_std * tf.random.normal(tf.shape(src_x))
+            noise = self._normal_like(src_x, sample_seeds, salt=salt)
+            return src_x + noise_std * noise
         return src_x

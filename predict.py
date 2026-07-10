@@ -1,7 +1,7 @@
 import argparse
+import zlib
 from pathlib import Path
 
-import commonlib
 import keras
 import numpy as np
 import tensorflow as tf
@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from data.dataloader_test import create_dataloader_test
+from inference_utils import resize_volume_to_shape, sliding_window_predict
 from main import gpu_setting, prepare_data_dict
 from trainers import BaseI2ITrainer, build_trainer
 
@@ -25,18 +26,7 @@ def load_checkpoint(checkpoint_path) -> tuple[BaseI2ITrainer, int]:
 
 def rescale_pred_to_org(pred, out_size_zyx):
     """正規化スペーシングの予測画像を元画像のクロップ領域サイズに戻す"""
-    transform = commonlib.RescaleTransform3DWithFilter(
-        commonlib.ImageFilter.LINEAR,
-        commonlib.ImageFilter.LINEAR,
-        commonlib.ImageFilter.LINEAR,
-        commonlib.ImageFilter.DEFAULT_OUT(np.float32),
-        commonlib.ImageFilter.DEFAULT_IN,
-        commonlib.ImageFilter.ZERO_OVER,
-    )
-    transform.SetOrgImageSize(*pred.shape[::-1])
-    transform.SetResultImageSize(*out_size_zyx[::-1])
-    transform.SetOrgImage(pred)
-    return transform.Transform()
+    return resize_volume_to_shape(pred, out_size_zyx, order=1, anti_alias=True)
 
 
 if __name__ == "__main__":
@@ -58,6 +48,8 @@ if __name__ == "__main__":
 
     # テスト時に使うGPUを設定
     gpu_setting(args.gpu, cfg.gpu_allow_growth)
+    policy_name = str(cfg.get("mixed_precision_policy", "float32"))
+    keras.mixed_precision.set_global_policy(policy_name)
 
     # データを準備
     val_dict = prepare_data_dict(cfg)[1]
@@ -67,23 +59,45 @@ if __name__ == "__main__":
     _model, step = load_checkpoint(checkpoint_path)
     logging.info(f"Loaded from: {checkpoint_path} (step: {step})")
 
-    # テスト時は入力サイズが可変なので可変に対応したモデルを作成
-    model: BaseI2ITrainer = build_trainer(cfg, (None, None, None, 1))
+    cfg_infer = cfg.get("inference", {})
+    use_sliding_window = bool(cfg_infer.get("sliding_window", True))
+    configured_patch = cfg_infer.get("patch_size_zyx", None)
+    patch_size_zyx = (
+        tuple(cfg.aug.crop_size_zyx)
+        if configured_patch is None
+        else tuple(configured_patch)
+    )
+    model_shape = patch_size_zyx + (1,) if use_sliding_window else (None, None, None, 1)
+    model: BaseI2ITrainer = build_trainer(cfg, model_shape)
     # 読み込んだコピーをセットする
     model.set_weights(_model.get_weights())
 
     for data in tqdm(test_loader):
-        # batch dimを追加（targetは推論に不要なので渡さない）
-        _data = dict(
-            src_imgs=data["img"][None],
-            img_msks=data["img_msk"][None],
-            src_min_clip_vals=data["src_min_clip_val"][None],
-            src_max_clip_vals=data["src_max_clip_val"][None],
-        )
-        pred = model.predict_step(_data)  # (1, z, y, x, 1) 値域は[0,1]
-        pred = pred.numpy()[0, :, :, :, 0]
-
         key = data["img_key"].numpy().decode()
+        cfg_repro = cfg.get("reproducibility", {})
+        base_seed = int(cfg_repro.get("seed", 0))
+        case_seed = (base_seed + zlib.crc32(key.encode())) & 0x7FFFFFFF
+        if use_sliding_window:
+            pred = sliding_window_predict(
+                model,
+                data,
+                patch_size_zyx,
+                overlap=float(cfg_infer.get("overlap", 0.5)),
+                batch_size=int(cfg_infer.get("batch_size", 1)),
+                base_seed=case_seed,
+            )
+        else:
+            # batch dimを追加（targetは推論に不要なので渡さない）
+            _data = dict(
+                src_imgs=data["img"][None],
+                img_msks=data["img_msk"][None],
+                src_min_clip_vals=data["src_min_clip_val"][None],
+                src_max_clip_vals=data["src_max_clip_val"][None],
+                sample_seeds=tf.constant([[base_seed, case_seed]], tf.int32),
+            )
+            pred = model.predict_step(_data)
+            pred = pred.numpy()[0, :, :, :, 0]
+
         img_size_zyx = data["img_size_zyx"].numpy()
         spacing_zyx = data["spacing_zyx"].numpy()
         crop_zyxzyx = data["crop_zyxzyx"].numpy()

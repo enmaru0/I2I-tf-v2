@@ -16,7 +16,9 @@ def prepare_thin2thick(
     spacing_max_val: float,
     thickness_range=[2, 6],
     thickness=None,
+    rng=None,
 ):
+    rng = random if rng is None else rng
     # if thickness is specified ignore thickness_range
     # 3方向がspacing_max_valよりも大きくないと実行しない
     if max(src_spacing_zyx) > spacing_max_val or not is_training:
@@ -32,10 +34,10 @@ def prepare_thin2thick(
         axis = 0
     else:
         axis_cand = [axis for axis in range(3) if thick2thin_rate_zyx[axis] > 0]
-        axis = random.choice(axis_cand)
-        if should_apply_condition(thick2thin_rate_zyx[axis], is_training):
+        axis = rng.choice(axis_cand)
+        if should_apply_condition(thick2thin_rate_zyx[axis], is_training, rng=rng):
             if thickness is None:
-                thickness = random.randint(thickness_range[0], thickness_range[1])
+                thickness = rng.randint(thickness_range[0], thickness_range[1])
             thickness = max(1, int((thickness / dst_spacing_zyx[axis]) + 0.5))
             extra_slice = thickness - crop_size_zyx[axis] % thickness + thickness
             apply_thin_thick = True

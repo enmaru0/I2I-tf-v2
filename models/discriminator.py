@@ -51,6 +51,7 @@ def build_patch_discriminator(
         use_bias=True,
         name="disc_logits",
         kernel_initializer="he_uniform",
+        dtype="float32",
     )(x)
 
     return Model(inputs=[input_src, input_img], outputs=logits, name=name)
