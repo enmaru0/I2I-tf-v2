@@ -331,6 +331,8 @@ def preprocess_image_np(
     self_noise = cfg.data.mode == "self_noise"
     self_sr = cfg.data.mode == "self_sr"
 
+    # 画像リサンプルの補間次数（回転による面内ボケを抑えるためcubic推奨）。マスクは常に0
+    img_interp_order = int(cfg.aug.image_interpolation_order)
     crop_size_zyx = cfg.aug.crop_size_zyx
     img_size_zyx, src_dtype, spacing_zyx = read_hdr(src_hdr_path)
 
@@ -385,7 +387,7 @@ def preprocess_image_np(
 
     if self_noise:
         # クリーン画像を1回だけアフィン変換し、targetとする
-        clean = affine_transform.apply(src_img, affine_matrix, order=1)
+        clean = affine_transform.apply(src_img, affine_matrix, order=img_interp_order)
         tgt_img = clean
         # sourceは劣化画像: モーションブラー→ガウシアンぼかし→ノイズの順に加える
         # ノイズ量は強度レンジ(正規化min-max)に対する相対量で指定する
@@ -414,7 +416,7 @@ def preprocess_image_np(
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     elif self_sr:
         # クリーン画像を1回だけアフィン変換し、targetとする
-        clean = affine_transform.apply(src_img, affine_matrix, order=1)
+        clean = affine_transform.apply(src_img, affine_matrix, order=img_interp_order)
         tgt_img = clean
         # sourceはスライス方向の低解像度シミュレーション
         # アフィン変換後のボクセル間隔はnorm_spacing_zyxになっている
@@ -457,7 +459,7 @@ def preprocess_image_np(
             use_memmap=True,
         )
         # targetをアフィン変換
-        tgt_img = affine_transform.apply(tgt_img, affine_matrix, order=1)
+        tgt_img = affine_transform.apply(tgt_img, affine_matrix, order=img_interp_order)
 
         # thin->thick変換の準備（sourceのみに適用する疑似thick化）
         thin2thick_param = prepare_thin2thick(
@@ -475,7 +477,7 @@ def preprocess_image_np(
         crop_size_extra = crop_size_zyx.copy()
         crop_size_extra[thin2thick_param["axis"]] += thin2thick_param["extra_slice"]
         affine_transform.crop_size_zyx = crop_size_extra  # 上書きするので注意
-        src_img = affine_transform.apply(src_img, affine_matrix, order=1)
+        src_img = affine_transform.apply(src_img, affine_matrix, order=img_interp_order)
 
         if thin2thick_param["apply_thin_thick"]:
             src_img = virtual_thick_generator(
@@ -719,6 +721,7 @@ def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
     """
     cfg_dc = cfg.data.real_dc
     hdr_path = Path(hdr_path_bytes.decode())
+    img_interp_order = int(cfg.aug.image_interpolation_order)
     crop_size_zyx = cfg.aug.crop_size_zyx
     img_size_zyx, img_dtype, spacing_zyx = read_hdr(hdr_path)
 
@@ -768,7 +771,7 @@ def preprocess_real_dc_image_np(hdr_path_bytes, cfg):
     )
     ones = np.ones(img.shape, np.uint8)
     img_msk = affine_transform.apply(ones, affine_matrix, order=0, cval=0)
-    img = affine_transform.apply(img, affine_matrix, order=1)
+    img = affine_transform.apply(img, affine_matrix, order=img_interp_order)
 
     return (
         add_channel_dim(img.astype(np.int16, copy=False)),
@@ -841,9 +844,10 @@ def preprocess_test_image_np(hdr_path: Path, cfg):
     スライス方向に解像度が低い入力（thickスライス等）は、このリサンプルで
     等方グリッドへ補間されてからモデルに入る。self_srの学習時sourceは
     「劣化→間引き→元グリッドへ補間」で作られるため、テスト入力もここで
-    同じグリッド・同じ線形補間に揃うことになる。
+    同じグリッド・同じ補間に揃うことになる。
     """
     hdr_path = Path(hdr_path)
+    img_interp_order = int(cfg.aug.image_interpolation_order)
     crop_size_zyx = cfg.aug.crop_size_zyx
     img_size_zyx, src_dtype, spacing_zyx = read_hdr(hdr_path)
 
@@ -875,7 +879,7 @@ def preprocess_test_image_np(hdr_path: Path, cfg):
     )
     ones = np.ones(src_img.shape, np.uint8)
     img_msk = affine_transform.apply(ones, affine_matrix, order=0, cval=0)
-    src_img = affine_transform.apply(src_img, affine_matrix, order=1)
+    src_img = affine_transform.apply(src_img, affine_matrix, order=img_interp_order)
 
     return (
         add_channel_dim(src_img.astype(np.float32)),

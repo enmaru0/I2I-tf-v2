@@ -205,6 +205,10 @@ optimizer:
 aug:
   crop_size_zyx: [128,128,128]
   thick2thin_rate_zyx: [0.0,0.0,0.0] # sourceのみ疑似thick化する。I2Iではデフォルト無効
+  # アフィン変換(回転・リサンプル)での画像の補間次数。scipy.ndimage.affine_transformのorder。
+  # 1=linear（従来。回転で面内高周波が2割落ちる）/ 3=cubic（推奨。喪失6%で鮮鋭さ保持）
+  # マスクは常に最近傍(order=0)。0〜5で指定可
+  image_interpolation_order: 3
 
   affine:
     norm_spacing_zyx: [1.0,1.0,1.0]

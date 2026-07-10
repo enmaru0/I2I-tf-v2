@@ -80,6 +80,11 @@ def read_cfg_and_parse_arg():
     assert cfg.data.mode in ["paired", "paired_dir", "self_noise", "self_sr"], (
         cfg.data.mode
     )
+    img_interp_order = int(cfg.aug.image_interpolation_order)
+    assert 0 <= img_interp_order <= 5, (
+        "aug.image_interpolation_orderは0〜5で指定してください"
+        f"（現在: {cfg.aug.image_interpolation_order}）"
+    )
     crop_exclude_start = float(cfg.aug.crop_exclude_start_slices)
     assert crop_exclude_start.is_integer() and crop_exclude_start >= 0, (
         "aug.crop_exclude_start_slicesは0以上の整数で指定してください"
