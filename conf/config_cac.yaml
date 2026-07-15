@@ -1,0 +1,110 @@
+# CAC motion correction専用の差分config。
+# 既存conf/config.yamlは変更せず、このファイルだけを指定して利用する。
+#
+# 実ペア学習:
+# python main.py --config conf/config_cac.yaml --overrides \
+#   data_dir=/path/to/non_gated data.target_data_dir=/path/to/gated
+#
+# 合成ペアでpretrain後、実ペアを指定してfinetuneする運用を推奨する。
+extends: config.yaml
+
+exp_dir: results/cac_motion
+batch_size: 1
+gradient_accumulation_steps: 4
+mixed_precision_policy: mixed_float16
+
+ema:
+  enabled: true
+  decay: 0.999
+
+data:
+  mode: paired_dir
+  target_data_dir: ""
+  cac_motion:
+    # image_blend: 高速な画像領域近似 / parallel_fbp: angle依存の投影・FBP近似
+    simulator: parallel_fbp
+    variants_per_case: 3
+    severity_range: [0.15, 1.0]
+    identity_probability: 0.1
+    num_motion_states: 8
+
+    # 単一時相を基準としたparametric cardiac motion。
+    target_phase: 0.75
+    heart_rate_bpm_range: [55.0, 100.0]
+    rotation_time_ms_range: [250.0, 500.0]
+    heart_rate_jitter_range: [0.0, 0.08]
+    in_plane_displacement_mm_range: [1.0, 8.0]
+    through_plane_displacement_mm_range: [0.0, 3.0]
+    rotation_deg_range: [0.0, 5.0]
+    contraction_range: [0.0, 0.04]
+    second_harmonic_range: [-0.25, 0.25]
+
+    # heart maskがない場合のsoft ellipsoid fallback。
+    # 実運用では同一shapeのheart maskを--heart-mask-dirで渡すことを推奨する。
+    fallback_center_fraction_zyx: [0.50, 0.55, 0.50]
+    fallback_radius_mm_zyx: [55.0, 70.0, 70.0]
+    mask_feather_mm: 10.0
+
+    image_blend:
+      num_samples: 8
+      noise_std_hu_range: [0.0, 20.0]
+      in_plane_blur_sigma_mm_range: [0.0, 0.6]
+
+    parallel_fbp:
+      # AX slice-wise parallel-beam近似。実scannerのcone/helical geometryではない。
+      num_views: 180
+      angular_range_deg: 180.0
+      mu_water_per_mm: 0.02
+      photon_count_range: [30000.0, 120000.0]
+      add_poisson_noise: true
+      in_plane_blur_sigma_mm_range: [0.0, 0.4]
+
+algorithm:
+  name: cac_regression
+  cac_regression:
+    output_mode: residual
+    threshold_hu: 130.0
+    l1_weight: 1.0
+    cac_l1_weight: 2.0
+    gradient_weight: 0.25
+    # 3 mm厚のz edgeは重み付けせず、0.5 mm面内だけを対象にする。
+    gradient_axes: [y, x]
+
+model:
+  unet:
+    # 3.0 mm厚のzを深層まで縮小しない異方性向け構成。
+    mode: mixed
+
+optimizer:
+  name: adamw
+  adamw:
+    warmup_lr: 1e-5
+    max_lr: 1e-4
+    warmup_ratio: 0.1
+    wd: 1e-4
+    clip_value: 10
+
+aug:
+  # 約72 x 64 x 64 mm。CAC局所patch用の初期値。
+  crop_size_zyx: [24, 128, 128]
+  image_interpolation_order: 1
+  require_pre_rescaled_dir: false
+  affine:
+    # native spacingを維持し、z方向の過剰補間を避ける。
+    norm_spacing_zyx: [3.0, 0.5, 0.5]
+    random_rot_deg_zyx: [0, 0, 0]
+    random_flip_axis_zyx: [false, false, false]
+    random_scaling_range_zyx: [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+    random_shift_rate_zyx: [0.0, 0.0, 0.0]
+  random_crop_method:
+    cac: 0.7
+    body: 0.0
+    image: 0.3
+
+image:
+  modality: CT
+  share_normalization: true
+  CT:
+    # -1000～2000 HUを保持し、CAC densityを360 HUで飽和させない。
+    window_level: 500
+    window_width: 3000

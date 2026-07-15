@@ -2,6 +2,8 @@ import keras
 import tensorflow as tf
 from absl import logging
 
+from optimizer_utils import get_optimizer_iterations
+
 
 class EMACallback(keras.callbacks.Callback):
     """
@@ -9,7 +11,8 @@ class EMACallback(keras.callbacks.Callback):
     拡散モデルやフロー系（edm / rectified_flow / i2i_rfr）で特に効果が大きい。
 
     動作:
-    - 学習バッチごとにshadow = decay*shadow + (1-decay)*weight で更新
+    - optimizer更新ごとにshadow = decay*shadow + (1-decay)*weight で更新
+      （gradient accumulation中の未更新micro batchでは更新しない）
     - 検証(on_test_begin)〜エポック終了(on_epoch_end)の間、generatorに
       EMA重みをスワップする。これにより
         * 検証メトリクス(val_psnr等)がEMA重みで計算される
@@ -31,6 +34,7 @@ class EMACallback(keras.callbacks.Callback):
         self.decay = decay
         self.shadow = None
         self.backup = None
+        self.last_optimizer_step = None
 
     def _generator_weights(self):
         return self.model.generator.weights
@@ -45,6 +49,9 @@ class EMACallback(keras.callbacks.Callback):
                 f"EMA initialized (decay={self.decay}, "
                 f"{len(self.shadow)} weight tensors)"
             )
+        self.last_optimizer_step = int(
+            get_optimizer_iterations(self.model.optimizer).numpy()
+        )
 
     @tf.function
     def _update_shadow(self):
@@ -52,7 +59,10 @@ class EMACallback(keras.callbacks.Callback):
             s.assign(self.decay * s + (1.0 - self.decay) * w)
 
     def on_train_batch_end(self, batch, logs=None):
-        self._update_shadow()
+        current_step = int(get_optimizer_iterations(self.model.optimizer).numpy())
+        if current_step > self.last_optimizer_step:
+            self._update_shadow()
+            self.last_optimizer_step = current_step
 
     def on_test_begin(self, logs=None):
         if self.shadow is None:

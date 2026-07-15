@@ -21,14 +21,30 @@ from callbacks import (
     UnifiedTensorBoardLogger,
     WallTimeLimit,
 )
-from data.dataloader import create_dataloader, create_test_batch, resolve_target_hdr_path
+from config_utils import load_config_with_extends
+from data.dataloader import (
+    create_dataloader,
+    create_test_batch,
+    resolve_target_hdr_path,
+)
 from optimizer_utils import get_optimizer_iterations
-from trainers import MODEL_REGISTRY, BaseI2ITrainer, attach_aux_optimizers, build_trainer
+from trainers import (
+    MODEL_REGISTRY,
+    BaseI2ITrainer,
+    attach_aux_optimizers,
+    build_trainer,
+)
 
 
 def read_cfg_and_parse_arg():
     # コマンドライン引数と設定ファイルを読み込む関数
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("conf/config.yaml"),
+        help="設定ファイル。extendsを指定した差分configも利用できます。",
+    )
     parser.add_argument(
         "--overrides",
         nargs="*",
@@ -38,8 +54,7 @@ def read_cfg_and_parse_arg():
     args = parser.parse_args()
     cmd_overrides = args.overrides
 
-    config_path = "conf/config.yaml"
-    cfg = OmegaConf.load(config_path)
+    cfg = load_config_with_extends(args.config)
 
     # コマンドライン引数で設定を上書きする
     override_config = OmegaConf.from_dotlist(cmd_overrides)
@@ -65,7 +80,9 @@ def read_cfg_and_parse_arg():
     )
     if rescaled_dir.exists():
         cfg.data_dir = rescaled_dir
-    elif target_scale_zyx[0] > 2:
+    elif target_scale_zyx[0] > 2 and bool(
+        cfg.aug.get("require_pre_rescaled_dir", True)
+    ):
         raise ValueError(
             "Thickスライスで学習する場合は./utils/rescale_dataset.pyで予めリスケールすることを推奨します"
         )
@@ -97,8 +114,18 @@ def read_cfg_and_parse_arg():
     assert int(cfg.inference.batch_size) >= 1, (
         "inference.batch_sizeは1以上を指定してください"
     )
-    assert cfg.data.mode in ["paired", "paired_dir", "self_noise", "self_sr"], (
-        cfg.data.mode
+    assert int(cfg.num_train_steps) >= 1, "num_train_stepsは1以上を指定してください"
+    assert int(cfg.eval_every) >= 1, "eval_everyは1以上を指定してください"
+    assert cfg.data.mode in [
+        "paired",
+        "paired_dir",
+        "denoise",
+        "self_noise",
+        "self_sr",
+    ], cfg.data.mode
+    gradient_accumulation_steps = int(cfg.get("gradient_accumulation_steps", 1))
+    assert gradient_accumulation_steps >= 1, (
+        "gradient_accumulation_stepsは1以上を指定してください"
     )
     img_interp_order = int(cfg.aug.image_interpolation_order)
     assert 0 <= img_interp_order <= 5, (
@@ -117,6 +144,17 @@ def read_cfg_and_parse_arg():
         assert str(axis_name) in ("z", "y", "x"), (
             f"evaluation.ssim_axesはz/y/xで指定してください: {axis_name}"
         )
+    if cfg.data.mode in ("denoise", "self_noise"):
+        simulation = str(cfg.data.self_noise.get("simulation", "gaussian")).lower()
+        assert simulation in ("gaussian", "rician", "kspace", "lowfield"), (
+            "data.self_noise.simulationはgaussian/rician/kspace/lowfieldで"
+            f"指定してください（現在: {simulation}）"
+        )
+        if simulation != "gaussian":
+            assert cfg.image.modality == "MR", (
+                f"{simulation} simulationはMRI magnitude画像向けです。"
+                "image.modality=MRを指定してください"
+            )
     if cfg.data.mode == "self_sr":
         for axis_name in list(cfg.data.self_sr.axes) + [cfg.data.self_sr.val_axis]:
             assert str(axis_name).upper() in ("AX", "COR", "SAG"), (
@@ -202,13 +240,24 @@ def read_cfg_and_parse_arg():
         f"algorithm.name={cfg.algorithm.name} は未実装です。"
         f"利用可能: {list(MODEL_REGISTRY.keys())}"
     )
-    if cfg.algorithm.name == "edm":
-        assert int(cfg.algorithm.edm.num_steps) >= 1, (
-            "algorithm.edm.num_stepsは1以上を指定してください"
+    if cfg.algorithm.name in ("edm", "edm_karras", "conditional_restoration_ode"):
+        cfg_algorithm = cfg.algorithm[cfg.algorithm.name]
+        assert int(cfg_algorithm.num_steps) >= 1, (
+            f"algorithm.{cfg.algorithm.name}.num_stepsは1以上を指定してください"
         )
-        assert int(cfg.algorithm.edm.num_steps_val) >= 1, (
-            "algorithm.edm.num_steps_valは1以上を指定してください"
+        assert int(cfg_algorithm.num_steps_val) >= 1, (
+            f"algorithm.{cfg.algorithm.name}.num_steps_valは1以上を指定してください"
         )
+        assert 0.0 < float(cfg_algorithm.sigma_min) < float(cfg_algorithm.sigma_max), (
+            f"algorithm.{cfg.algorithm.name}は0 < sigma_min < sigma_maxが必要です"
+        )
+        assert str(cfg_algorithm.get("solver", "heun")) in ("euler", "heun"), (
+            f"algorithm.{cfg.algorithm.name}.solverはeuler/heunで指定してください"
+        )
+        if cfg.algorithm.name == "conditional_restoration_ode":
+            assert float(cfg_algorithm.P_std) > 0.0, (
+                "conditional_restoration_ode.P_stdは正の値を指定してください"
+            )
     assert cfg.model.num_channel == 1, (
         "グレースケール画像変換なのでmodel.num_channelは1を指定してください"
     )
@@ -230,12 +279,12 @@ def prepare_data_dict(cfg):
     sourceのhdrパスのリストをデータセットごとに列挙する。
     - paired: source xxx.hdr, target xxx{target_suffix}.hdr（同一フォルダ、命名規則）
     - paired_dir: source(data_dir)とtarget(target_data_dir)を別フォルダの同名ファイルで対応
-    - self_noise / self_sr: クリーン画像のみ（targetファイルは不要。劣化はローダ内で合成）
+    - denoise / self_noise / self_sr: クリーン画像のみ（targetファイルは不要。劣化はローダ内で合成）
     targetやマスク類のrawファイルは除外する。
     """
     data_dir = Path(cfg.data_dir)
     target_suffix = cfg.data.target_suffix
-    no_target = cfg.data.mode in ("self_noise", "self_sr")
+    no_target = cfg.data.mode in ("denoise", "self_noise", "self_sr")
 
     def _collect(split_name):
         data_dict = defaultdict(dict)
@@ -279,7 +328,7 @@ def select_optimizer(cfg):
     warmup_steps = int(cfg_opt.warmup_ratio * cfg.num_train_steps)
     lr_schedule = CosineDecay(
         cfg_opt.warmup_lr,
-        cfg.num_train_steps - warmup_steps,
+        max(1, cfg.num_train_steps - warmup_steps),
         alpha=0.0,
         name="CosineDecay",
         warmup_target=cfg_opt.max_lr,
@@ -359,6 +408,10 @@ if __name__ == "__main__":
 
     # オプティマイザを選択する
     optimizer = select_optimizer(cfg)
+    # gradient accumulationのtf.cond内でslot variableが初回作成されないよう、
+    # jit_compile前にoptimizerを明示的にbuildする。
+    if hasattr(optimizer, "build"):
+        optimizer.build(model.generator.trainable_variables)
 
     # モデルをコンパイル
     # lossとmetricsはいろいろとカスタマイズしたい場所なので、
@@ -377,7 +430,7 @@ if __name__ == "__main__":
     profile_batch = (32, 64) if cfg.enable_profiling else 0  # プロファイリングする範囲
     tensorboard_callback = UnifiedTensorBoardLogger(
         log_dir=tensorboard_dir,
-        step_per_epoch=cfg.eval_every,  # 1エポックあたりのステップ数
+        step_per_epoch=cfg.eval_every,  # 1エポックあたりのoptimizer更新数
         write_images=True,  # 訓練中の画像をログに保存
         profile_batch=profile_batch,
         write_steps_per_second=True,
@@ -424,11 +477,25 @@ if __name__ == "__main__":
         assert cfg.restore.exists(), f"restore path not found: {cfg.restore}"
         model = keras.models.load_model(cfg.restore)
         model.cfg = cfg
+        restored_accumulation_steps = int(
+            getattr(model, "gradient_accumulation_steps", 1)
+        )
+        requested_accumulation_steps = int(cfg.get("gradient_accumulation_steps", 1))
+        assert restored_accumulation_steps == requested_accumulation_steps, (
+            "restore時はgradient_accumulation_stepsを変更できません: "
+            f"checkpoint={restored_accumulation_steps}, "
+            f"config={requested_accumulation_steps}"
+        )
         # 補助optimizer(discriminator用など)は状態が復元されないので再作成する
         attach_aux_optimizers(model, cfg)
-        step = get_optimizer_iterations(model.optimizer).numpy()
-        logging.info(f"Restoring from {cfg.restore}. (step: {step})")
-        initial_epoch = step // cfg.eval_every
+        optimizer_step = int(get_optimizer_iterations(model.optimizer).numpy())
+        processed_micro_steps = optimizer_step * restored_accumulation_steps
+        logging.info(
+            f"Restoring from {cfg.restore}. "
+            f"(optimizer step: {optimizer_step}, "
+            f"processed micro steps: {processed_micro_steps})"
+        )
+        initial_epoch = optimizer_step // cfg.eval_every
     elif cfg.finetune:
         # 事前学習済みモデルをファインチューニングする場合
         assert cfg.finetune.exists(), f"finetune path not found: {cfg.finetune}"
@@ -463,7 +530,9 @@ if __name__ == "__main__":
         x=train_loader,
         validation_data=val_loader,
         epochs=math.ceil(cfg.num_train_steps / cfg.eval_every),
-        steps_per_epoch=cfg.eval_every,
+        steps_per_epoch=(
+            cfg.eval_every * int(cfg.get("gradient_accumulation_steps", 1))
+        ),
         callbacks=callbacks,
         initial_epoch=initial_epoch,
         verbose=0,

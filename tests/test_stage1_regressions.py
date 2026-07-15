@@ -12,13 +12,18 @@ from callbacks.image_logger import as_axis_list, axis_display_name, axis_section
 from data.dataloader import (
     _reconstruct_axis0,
     _sample_axis0,
+    apply_random_contrast_augmentation,
     make_batch_dict,
     resolve_target_hdr_path,
+    simulate_kspace_noise,
+    simulate_lowfield_noise,
+    simulate_rician_noise,
 )
 from data.utils import AffineTransform
 from losses import masked_psnr_per_sample, ssim_per_sample
 from inference_utils import resize_volume_to_shape, sliding_window_predict
 from trainers.base import BaseI2ITrainer
+from trainers.conditional_restoration_ode import conditional_restoration_sigma_schedule
 from trainers.edm import edm_sigma_schedule
 from optimizer_utils import get_optimizer_iterations
 
@@ -37,18 +42,18 @@ class Stage1RegressionTests(unittest.TestCase):
             "learning_rate": 9.0,
         }
         self.assertEqual(
-            list(ConciseProgbarLogger.filter_logs(logs)),
-            ["psnr", "ssim", "total_loss"],
+            list(ConciseProgbarLogger.filter_logs(logs)), ["psnr", "ssim", "total_loss"]
         )
 
     def test_tensorboard_axes_accept_anatomical_names(self):
         self.assertEqual(as_axis_list(["AX", "COR", "SAG"]), ["z", "y", "x"])
         self.assertEqual(as_axis_list(["z", "COR", "sagittal"]), ["z", "y", "x"])
         self.assertEqual(
-            [axis_display_name(axis) for axis in ("z", "y", "x")],
-            ["AX", "COR", "SAG"],
+            [axis_display_name(axis) for axis in ("z", "y", "x")], ["AX", "COR", "SAG"]
         )
-        self.assertEqual(axis_section_name("Test Prediction", "z"), "Test Prediction (AX)")
+        self.assertEqual(
+            axis_section_name("Test Prediction", "z"), "Test Prediction (AX)"
+        )
         self.assertEqual(
             axis_section_name("Test Prediction", "y"), "Test Prediction (COR)"
         )
@@ -57,9 +62,7 @@ class Stage1RegressionTests(unittest.TestCase):
         )
 
     def test_resolve_target_path_accepts_full_config(self):
-        cfg = OmegaConf.create(
-            {"data": {"mode": "paired", "target_suffix": ".target"}}
-        )
+        cfg = OmegaConf.create({"data": {"mode": "paired", "target_suffix": ".target"}})
         target = resolve_target_hdr_path(Path("/tmp/case.hdr"), cfg)
         self.assertEqual(target, Path("/tmp/case.target.hdr"))
 
@@ -69,6 +72,91 @@ class Stage1RegressionTests(unittest.TestCase):
     def test_edm_schedule_rejects_zero_steps(self):
         with self.assertRaises(ValueError):
             edm_sigma_schedule(0, 0.002, 80.0, 7.0)
+
+    def test_conditional_restoration_schedule_is_log_linear(self):
+        schedule = conditional_restoration_sigma_schedule(3, 0.01, 100.0)
+        np.testing.assert_allclose(schedule, [100.0, 1.0, 0.01, 0.0])
+
+    def test_denoise_simulations_are_deterministic_and_finite(self):
+        clean = np.ones((3, 12, 10), np.float32)
+        for simulator, kwargs in (
+            (simulate_rician_noise, {"sigma": 0.1, "grain_sigma": 1.0}),
+            (simulate_kspace_noise, {"sigma_image": 0.1, "resolution_reduction": 0.2}),
+        ):
+            output1 = simulator(clean, rng=np.random.default_rng(11), **kwargs)
+            output2 = simulator(clean, rng=np.random.default_rng(11), **kwargs)
+            self.assertEqual(output1.shape, clean.shape)
+            self.assertTrue(np.isfinite(output1).all())
+            np.testing.assert_array_equal(output1, output2)
+
+    def test_lowfield_simulation_preserves_shape(self):
+        cfg = OmegaConf.create(
+            {
+                "profiles": [
+                    {
+                        "name": "test",
+                        "weight": 1.0,
+                        "target_snr": [8.0, 8.0],
+                        "downsample": [0.5, 0.5],
+                        "noise_corr_mm": [1.0, 1.0],
+                        "kspace_keep": [0.5, 0.5],
+                    }
+                ],
+                "target_snr_min": 5.0,
+                "target_snr_max": 15.0,
+                "downsample_min": 0.5,
+                "downsample_max": 1.0,
+                "noise_corr_mm_max": 2.0,
+                "kspace_keep_min": 0.2,
+                "kspace_keep_max": 1.0,
+            }
+        )
+        clean = np.linspace(0.0, 1.0, 3 * 12 * 10, dtype=np.float32).reshape(3, 12, 10)
+        output = simulate_lowfield_noise(
+            clean,
+            (1.0, 0.8, 0.8),
+            cfg,
+            rng=np.random.default_rng(3),
+            profile_name="test",
+        )
+        self.assertEqual(output.shape, clean.shape)
+        self.assertTrue(np.isfinite(output).all())
+
+    def test_contrast_augmentation_is_shared(self):
+        cfg = OmegaConf.create(
+            {
+                "enabled": True,
+                "p_apply": 1.0,
+                "percentile_range": [0.0, 100.0],
+                "gamma_range": [1.2, 1.2],
+                "scale_range": [0.9, 0.9],
+                "shift_range": [0.1, 0.1],
+                "invert_prob": 0.0,
+                "bias_field_prob": 0.0,
+            }
+        )
+        image = np.linspace(0.0, 1.0, 64, dtype=np.float32).reshape(4, 4, 4)
+        first, second = apply_random_contrast_augmentation(
+            [image, image.copy()], cfg, rng=np.random.default_rng(5)
+        )
+        np.testing.assert_array_equal(first, second)
+        self.assertFalse(np.array_equal(first, image))
+
+    def test_gradient_accumulation_updates_on_configured_step(self):
+        generator = tf.keras.Sequential(
+            [tf.keras.Input((1,)), tf.keras.layers.Dense(1, use_bias=False)]
+        )
+        generator.layers[0].kernel.assign([[1.0]])
+        trainer = BaseI2ITrainer(generator, gradient_accumulation_steps=2)
+        optimizer = tf.keras.optimizers.SGD(learning_rate=1.0)
+        if hasattr(optimizer, "build"):
+            optimizer.build(generator.trainable_variables)
+        gradients = [tf.constant([[2.0]])]
+        trainer._apply_gradients(optimizer, gradients, generator.trainable_variables)
+        np.testing.assert_allclose(generator.layers[0].kernel.numpy(), [[1.0]])
+        trainer._apply_gradients(optimizer, gradients, generator.trainable_variables)
+        np.testing.assert_allclose(generator.layers[0].kernel.numpy(), [[-1.0]])
+        self.assertEqual(int(optimizer.iterations.numpy()), 1)
 
     def test_disabled_gpu_augmentations_are_not_called(self):
         cfg = OmegaConf.load("conf/config.yaml")
@@ -95,9 +183,7 @@ class Stage1RegressionTests(unittest.TestCase):
             patcher.start()
         self.addCleanup(lambda: [patcher.stop() for patcher in reversed(patches)])
 
-        output = BaseI2ITrainer.gpu_aug(
-            imgs, msks, min_vals, max_vals, cfg
-        ).numpy()
+        output = BaseI2ITrainer.gpu_aug(imgs, msks, min_vals, max_vals, cfg).numpy()
         self.assertTrue((output == 0.5).all())
 
     def test_stateless_noise_is_reproducible_per_case(self):
@@ -157,19 +243,13 @@ class Stage1RegressionTests(unittest.TestCase):
         self.assertGreater(float(psnr[0]), float(psnr[1]))
 
         identical_ssim = ssim_per_sample(
-            target,
-            target,
-            msk=mask,
-            axes=("z", "y", "x"),
-            min_slice_mask_coverage=0.1,
+            target, target, msk=mask, axes=("z", "y", "x"), min_slice_mask_coverage=0.1
         )
         self.assertTrue((identical_ssim.numpy() > 0.999).all())
 
     def test_sr_sampling_and_reconstruction_are_separate(self):
         volume = np.arange(9, dtype=np.float32)[:, None, None]
-        samples, positions = _sample_axis0(
-            volume, interval_px=2.0, phase_px=1, order=1
-        )
+        samples, positions = _sample_axis0(volume, interval_px=2.0, phase_px=1, order=1)
         np.testing.assert_allclose(positions, [1.0, 3.0, 5.0, 7.0])
         np.testing.assert_allclose(samples[:, 0, 0], positions)
 
@@ -219,9 +299,7 @@ class Stage1RegressionTests(unittest.TestCase):
 
     def test_resize_volume_matches_requested_shape(self):
         image = np.ones((5, 7, 9), np.float32)
-        resized = resize_volume_to_shape(
-            image, (8, 6, 11), order=3, anti_alias=True
-        )
+        resized = resize_volume_to_shape(image, (8, 6, 11), order=3, anti_alias=True)
         self.assertEqual(resized.shape, (8, 6, 11))
         np.testing.assert_allclose(resized, 1.0, atol=1e-5)
 

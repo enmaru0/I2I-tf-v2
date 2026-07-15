@@ -20,9 +20,7 @@ def edm_sigma_schedule(
     return [
         (
             sigma_max ** (1 / rho)
-            + i
-            / (num_steps - 1)
-            * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
+            + i / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
         )
         ** rho
         for i in range(num_steps)
@@ -61,9 +59,7 @@ class EDMTrainer(BaseI2ITrainer):
 
         # ノイズレベルは定数チャンネルとして与える（U-Net本体を変えないための簡易実装）
         noise_ch = ops.ones_like(x_noisy) * c_noise
-        net_in = ops.concatenate(
-            [c_in * x_noisy * img_msks, src_x, noise_ch], axis=-1
-        )
+        net_in = ops.concatenate([c_in * x_noisy * img_msks, src_x, noise_ch], axis=-1)
         network_out = self([net_in, img_msks], training=training)
         return (c_skip * x_noisy + c_out * network_out) * img_msks
 
@@ -128,8 +124,8 @@ class EDMTrainer(BaseI2ITrainer):
             loss, denoised = self._denoise_loss(y, src_x, img_msks, training=True)
             scaled_loss = self._scale_loss_for_optimizer(loss, self.optimizer)
         gradients = tape.gradient(scaled_loss, self.generator.trainable_variables)
-        self.optimizer.apply_gradients(
-            zip(gradients, self.generator.trainable_variables)
+        self._apply_gradients(
+            self.optimizer, gradients, self.generator.trainable_variables
         )
 
         # 学習中のpsnr/ssimはdenoise出力の品質（サンプリングはしない）

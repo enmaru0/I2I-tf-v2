@@ -122,8 +122,8 @@ class RectifiedFlowTrainer(BaseI2ITrainer):
             loss = self._add_real_dc_loss(loss, data)
             scaled_loss = self._scale_loss_for_optimizer(loss, self.optimizer)
         gradients = tape.gradient(scaled_loss, self.generator.trainable_variables)
-        self.optimizer.apply_gradients(
-            zip(gradients, self.generator.trainable_variables)
+        self._apply_gradients(
+            self.optimizer, gradients, self.generator.trainable_variables
         )
 
         x1_hat01 = self._to_01(x1_hat, img_msks)

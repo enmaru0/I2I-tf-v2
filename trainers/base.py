@@ -34,10 +34,20 @@ class BaseI2ITrainer(Model):
     # サブクラスで上書きする
     METRIC_NAMES = ["total_loss", "psnr", "ssim"]
 
-    def __init__(self, generator: Model, **kwargs):
+    def __init__(
+        self, generator: Model, gradient_accumulation_steps: int = 1, **kwargs
+    ):
         super().__init__(**kwargs)
         self.generator = generator
         self.cfg = None  # 学習・推論スクリプト側でセットする（保存されない）
+        self.gradient_accumulation_steps = int(gradient_accumulation_steps)
+        if self.gradient_accumulation_steps < 1:
+            raise ValueError("gradient_accumulation_stepsは1以上を指定してください")
+        self._gradient_accumulators = {}
+        self._gradient_accumulation_counters = {}
+        self._create_gradient_accumulators(
+            "generator", self.generator.trainable_variables
+        )
 
     def call(self, inputs, training=False):
         return self.generator(inputs, training=training)
@@ -45,13 +55,12 @@ class BaseI2ITrainer(Model):
     def get_config(self):
         config = super().get_config()
         config["generator"] = keras.saving.serialize_keras_object(self.generator)
+        config["gradient_accumulation_steps"] = self.gradient_accumulation_steps
         return config
 
     @classmethod
     def from_config(cls, config):
-        config["generator"] = keras.saving.deserialize_keras_object(
-            config["generator"]
-        )
+        config["generator"] = keras.saving.deserialize_keras_object(config["generator"])
         return cls(**config)
 
     @property
@@ -141,6 +150,88 @@ class BaseI2ITrainer(Model):
         if hasattr(optimizer, "scale_loss"):
             return optimizer.scale_loss(loss)
         return loss
+
+    def _create_gradient_accumulators(self, key, variables):
+        """optimizerごとに勾配バッファとmicro-step counterを作る。"""
+        if self.gradient_accumulation_steps == 1 or key in self._gradient_accumulators:
+            return
+        variables = list(variables)
+
+        def _device(variable):
+            # 通常の単一GPU学習ではKerasのnon-trainable weightがCPUへ
+            # pinされる場合がある。XLA GPU graphはCPU resourceを参照できないため、
+            # GPUがあればaccumulation stateもGPUへ明示配置する。
+            logical_gpus = tf.config.list_logical_devices("GPU")
+            if logical_gpus:
+                return logical_gpus[0].name
+            value = getattr(variable, "value", variable)
+            return getattr(value, "device", None)
+
+        accumulators = []
+        for i, variable in enumerate(variables):
+            # XLAでは別device上のresource variableを参照できないため、
+            # accumulatorを対応する学習weightと同じdeviceへ明示配置する。
+            with tf.device(_device(variable)):
+                accumulators.append(
+                    self.add_weight(
+                        name=f"{key}_gradient_accumulator_{i}",
+                        shape=variable.shape,
+                        dtype=variable.dtype,
+                        initializer="zeros",
+                        trainable=False,
+                    )
+                )
+        self._gradient_accumulators[key] = accumulators
+        with tf.device(_device(variables[0])):
+            self._gradient_accumulation_counters[key] = self.add_weight(
+                name=f"{key}_gradient_accumulation_counter",
+                shape=(),
+                # TensorFlowはint32 resource variableをGPU指定してもCPUへ置く。
+                # XLA GPUから参照できるよう、整数値をfloat32で保持する。
+                dtype="float32",
+                initializer="zeros",
+                trainable=False,
+            )
+
+    def _apply_gradients(self, optimizer, gradients, variables, key="generator"):
+        """
+        micro batchの勾配を平均し、設定回数ごとにoptimizerを1回更新する。
+
+        LossScaleOptimizerの場合もscale済み勾配を同じloss scaleのまま平均し、
+        apply_gradients側で通常どおりunscaleさせる。
+        """
+        variables = list(variables)
+        gradients = list(gradients)
+        if self.gradient_accumulation_steps == 1:
+            optimizer.apply_gradients(
+                (gradient, variable)
+                for gradient, variable in zip(gradients, variables)
+                if gradient is not None
+            )
+            return
+
+        self._create_gradient_accumulators(key, variables)
+        accumulators = self._gradient_accumulators[key]
+        counter = self._gradient_accumulation_counters[key]
+        for accumulator, gradient in zip(accumulators, gradients):
+            if gradient is not None:
+                accumulator.assign_add(ops.cast(gradient, accumulator.dtype))
+        counter.assign_add(1)
+
+        def _apply_and_reset():
+            scale = ops.cast(self.gradient_accumulation_steps, accumulators[0].dtype)
+            averaged = [accumulator / scale for accumulator in accumulators]
+            optimizer.apply_gradients(zip(averaged, variables))
+            for accumulator in accumulators:
+                accumulator.assign(ops.zeros_like(accumulator))
+            counter.assign(0)
+            return tf.constant(0)
+
+        tf.cond(
+            ops.equal(counter, ops.cast(self.gradient_accumulation_steps, "float32")),
+            _apply_and_reset,
+            lambda: tf.constant(0),
+        )
 
     def _to_image(self, logits, src_imgs):
         """logitsを[0,1]レンジの画像に変換する（クリップ前）"""
@@ -277,10 +368,7 @@ class BaseI2ITrainer(Model):
         # 無効な拡張はグラフへ入れない。特に3D Gaussian filterはコストが大きい。
         if float(cfg_aug.random_normalize.prob) > 0.0:
             src_imgs = random_normalize(
-                src_imgs,
-                min_clip_vals,
-                max_clip_vals,
-                **cfg_aug.random_normalize,
+                src_imgs, min_clip_vals, max_clip_vals, **cfg_aug.random_normalize
             )
         else:
             src_imgs = normalize(src_imgs, min_clip_vals, max_clip_vals)

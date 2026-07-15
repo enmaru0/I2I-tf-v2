@@ -10,7 +10,9 @@ from losses import masked_psnr_per_sample, ssim_per_sample
 from .base import BaseI2ITrainer
 
 
-def resshift_eta_schedule(num_steps: int, kappa: float, schedule_p: float) -> list[float]:
+def resshift_eta_schedule(
+    num_steps: int, kappa: float, schedule_p: float
+) -> list[float]:
     """
     ResShift (Yue et al. 2023) のシフトスケジュールη。edm-torch実装と同一。
     η[0]=0（便宜上）、η[1..T]はsqrt(η)が幾何級数的に増える非一様スケジュール。
@@ -28,9 +30,9 @@ def resshift_eta_schedule(num_steps: int, kappa: float, schedule_p: float) -> li
     if num_steps > 2:
         b0 = math.exp(0.5 * math.log(eta_t / eta_1) / float(num_steps - 1))
         for t in range(2, num_steps):
-            beta_t = ((float(t - 1) / float(num_steps - 1)) ** float(schedule_p)) * float(
-                num_steps - 1
-            )
+            beta_t = (
+                (float(t - 1) / float(num_steps - 1)) ** float(schedule_p)
+            ) * float(num_steps - 1)
             sqrt_eta = math.sqrt(eta_1) * (b0**beta_t)
             eta[t] = sqrt_eta**2
     return eta
@@ -178,8 +180,8 @@ class ResShiftTrainer(BaseI2ITrainer):
             loss = self._add_real_dc_loss(loss, data)
             scaled_loss = self._scale_loss_for_optimizer(loss, self.optimizer)
         gradients = tape.gradient(scaled_loss, self.generator.trainable_variables)
-        self.optimizer.apply_gradients(
-            zip(gradients, self.generator.trainable_variables)
+        self._apply_gradients(
+            self.optimizer, gradients, self.generator.trainable_variables
         )
 
         x0_pred01 = self._to_01(x0_pred, img_msks)

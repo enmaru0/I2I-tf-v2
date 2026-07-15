@@ -41,7 +41,9 @@ def estimate_noise_sigma_slice(slc: np.ndarray, mask: np.ndarray) -> float | Non
     n_valid = int(mask.sum())
     if n_valid < 1000:  # 前景が少なすぎるスライスはスキップ
         return None
-    response = np.abs(convolve(slc.astype(np.float32), IMMERKAER_KERNEL, mode="reflect"))
+    response = np.abs(
+        convolve(slc.astype(np.float32), IMMERKAER_KERNEL, mode="reflect")
+    )
     total = float(response[mask].sum())
     return math.sqrt(math.pi / 2.0) * total / (6.0 * n_valid)
 
@@ -110,9 +112,11 @@ def calibrate_noise(hdr_list, cfg, foreground_threshold_rel, slice_stride):
         f'  "data.self_noise.noise_std_rel_range=[{lo},{hi}]" '
         f"data.self_noise.val_noise_std_rel={med}"
     )
-    print("\n注意: Immerkær法はテクスチャや平滑化の影響を受けます。実データが"
-          "既にノイズ除去済み・圧縮済みの場合は過小評価になります。"
-          "probe_sim2real.pyで校正後のギャップを確認してください。")
+    print(
+        "\n注意: Immerkær法はテクスチャや平滑化の影響を受けます。実データが"
+        "既にノイズ除去済み・圧縮済みの場合は過小評価になります。"
+        "probe_sim2real.pyで校正後のギャップを確認してください。"
+    )
 
 
 def calibrate_sr(hdr_list, cfg):
@@ -141,13 +145,17 @@ def calibrate_sr(hdr_list, cfg):
     hi = round(float(vals.max()), 1)
     med = round(float(np.median(vals)), 1)
     val_axis = AXIS_NAMES[max(axis_counts, key=axis_counts.get)]
-    print(f"\n  症例数: {len(vals)}  軸分布: "
-          + ", ".join(f"{AXIS_NAMES[a]}={c}" for a, c in axis_counts.items()))
+    print(
+        f"\n  症例数: {len(vals)}  軸分布: "
+        + ", ".join(f"{AXIS_NAMES[a]}={c}" for a, c in axis_counts.items())
+    )
     print(f"  間隔[mm] min/median/max = {lo}/{med}/{hi}")
     print("\n=== 推奨設定 (conf/config.yaml の data.self_sr) ===")
     print(f"    axes: [{', '.join(axes)}]")
     print(f"    slice_interval_mm_range: [{lo}, {hi}]")
-    print(f"    slice_thickness_mm_range: [{lo}, {hi}] # 厚みは間隔と同値と仮定（要確認）")
+    print(
+        f"    slice_thickness_mm_range: [{lo}, {hi}] # 厚みは間隔と同値と仮定（要確認）"
+    )
     print(f"    val_axis: {val_axis}")
     print(f"    val_slice_interval_mm: {med}")
     print(f"    val_slice_thickness_mm: {med}")
@@ -169,10 +177,12 @@ def calibrate_sr(hdr_list, cfg):
         f"data.self_sr.val_slice_interval_mm={med} "
         f"data.self_sr.val_slice_thickness_mm={med}"
     )
-    print("\n注意: スキャナ側で薄スライスへ補間済みのデータはスペーシングが実効"
-          "間隔と一致しません（その場合は撮像プロトコルの値を使ってください）。"
-          "スライス厚（プロファイル幅）はヘッダから分からないため間隔と同値を"
-          "仮定しています。ギャップ縮小の確認にはprobe_sim2real.pyを使ってください。")
+    print(
+        "\n注意: スキャナ側で薄スライスへ補間済みのデータはスペーシングが実効"
+        "間隔と一致しません（その場合は撮像プロトコルの値を使ってください）。"
+        "スライス厚（プロファイル幅）はヘッダから分からないため間隔と同値を"
+        "仮定しています。ギャップ縮小の確認にはprobe_sim2real.pyを使ってください。"
+    )
 
 
 def _read_volume(hdr_path: Path):
@@ -182,17 +192,27 @@ def _read_volume(hdr_path: Path):
 
 def main():
     parser = argparse.ArgumentParser(description="実劣化画像からのシミュレーション校正")
-    parser.add_argument("--real_dir", type=Path, required=True,
-                        help="実劣化画像(.hdr/.raw)のフォルダ")
+    parser.add_argument(
+        "--real_dir", type=Path, required=True, help="実劣化画像(.hdr/.raw)のフォルダ"
+    )
     parser.add_argument("--config", type=str, default="conf/config.yaml")
     parser.add_argument("--overrides", nargs="*", default=[])
-    parser.add_argument("--task", choices=["auto", "noise", "sr"], default="auto",
-                        help="auto: cfg.data.modeから決める")
+    parser.add_argument(
+        "--task",
+        choices=["auto", "noise", "sr"],
+        default="auto",
+        help="auto: cfg.data.modeから決める",
+    )
     parser.add_argument("--max_volumes", default=64, type=int)
-    parser.add_argument("--foreground_threshold_rel", default=0.05, type=float,
-                        help="前景マスクの閾値（clipレンジに対する相対値）")
-    parser.add_argument("--slice_stride", default=2, type=int,
-                        help="ノイズ推定に使うスライスの間引き幅")
+    parser.add_argument(
+        "--foreground_threshold_rel",
+        default=0.05,
+        type=float,
+        help="前景マスクの閾値（clipレンジに対する相対値）",
+    )
+    parser.add_argument(
+        "--slice_stride", default=2, type=int, help="ノイズ推定に使うスライスの間引き幅"
+    )
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -200,14 +220,14 @@ def main():
 
     task = args.task
     if task == "auto":
-        task = {"self_noise": "noise", "self_sr": "sr"}.get(str(cfg.data.mode))
+        task = {"denoise": "noise", "self_noise": "noise", "self_sr": "sr"}.get(
+            str(cfg.data.mode)
+        )
         assert task is not None, (
             f"data.mode={cfg.data.mode}からタスクを決められません。--taskを指定してください"
         )
 
-    hdr_list = [
-        p for p in sorted(args.real_dir.glob("*.hdr")) if ".mask" not in p.name
-    ]
+    hdr_list = [p for p in sorted(args.real_dir.glob("*.hdr")) if ".mask" not in p.name]
     if args.max_volumes > 0:
         hdr_list = hdr_list[: args.max_volumes]
     assert len(hdr_list) > 0, f"画像(.hdr)が見つかりません: {args.real_dir}"

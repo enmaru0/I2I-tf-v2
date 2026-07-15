@@ -30,11 +30,7 @@ import tensorflow as tf
 from absl import logging
 from omegaconf import OmegaConf
 
-from data.dataloader import (
-    apply_random_self_noise,
-    apply_random_self_sr,
-    get_clip_vals,
-)
+from data.dataloader import apply_random_self_noise, apply_random_self_sr, get_clip_vals
 from data.dataloader_utils import save_intensity
 from data.utils import (
     AffineTransform,
@@ -119,14 +115,19 @@ def build_sim_degrade_fn(cfg):
                 img, cfg.aug.affine.norm_spacing_zyx, cfg.data.self_sr
             )
 
-    elif mode == "self_noise":
+    elif mode in ("denoise", "self_noise"):
 
         def degrade(img, intensity_range):
-            return apply_random_self_noise(img, intensity_range, cfg.data.self_noise)
+            return apply_random_self_noise(
+                img,
+                intensity_range,
+                cfg.data.self_noise,
+                norm_spacing_zyx=cfg.aug.affine.norm_spacing_zyx,
+            )
 
     else:
         raise ValueError(
-            f"probeはdata.mode=self_sr/self_noiseで使ってください（現在: {mode}）"
+            f"probeはdata.mode=self_sr/denoise/self_noiseで使ってください（現在: {mode}）"
         )
     return degrade
 
@@ -154,26 +155,39 @@ def save_example_png(patch, score, out_path: Path):
 def main():
     logging.set_verbosity(logging.INFO)
     parser = argparse.ArgumentParser(description="sim/real劣化分布の判別器プローブ")
-    parser.add_argument("--real_dir", type=Path, required=True,
-                        help="実劣化画像(.hdr/.raw)のフォルダ")
+    parser.add_argument(
+        "--real_dir", type=Path, required=True, help="実劣化画像(.hdr/.raw)のフォルダ"
+    )
     parser.add_argument("--config", type=str, default="conf/config.yaml")
     parser.add_argument("--overrides", nargs="*", default=[])
     parser.add_argument("--gpu", default="0", type=str)
-    parser.add_argument("--max_volumes", default=32, type=int,
-                        help="各サイドで使う最大症例数")
+    parser.add_argument(
+        "--max_volumes", default=32, type=int, help="各サイドで使う最大症例数"
+    )
     parser.add_argument("--patches_per_volume", default=8, type=int)
-    parser.add_argument("--patch_size", nargs=3, type=int, default=[64, 64, 64],
-                        metavar=("Z", "Y", "X"))
-    parser.add_argument("--steps", default=1000, type=int, help="判別器の学習ステップ数")
+    parser.add_argument(
+        "--patch_size", nargs=3, type=int, default=[64, 64, 64], metavar=("Z", "Y", "X")
+    )
+    parser.add_argument(
+        "--steps", default=1000, type=int, help="判別器の学習ステップ数"
+    )
     parser.add_argument("--batch_size", default=16, type=int)
     parser.add_argument("--lr", default=2e-4, type=float)
     parser.add_argument("--base_ch", default=16, type=int)
     parser.add_argument("--num_layers", default=3, type=int)
-    parser.add_argument("--holdout_ratio", default=0.25, type=float,
-                        help="評価用にホールドアウトする症例の割合")
+    parser.add_argument(
+        "--holdout_ratio",
+        default=0.25,
+        type=float,
+        help="評価用にホールドアウトする症例の割合",
+    )
     parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--examples_dir", type=Path, default=None,
-                        help="指定すると評価パッチのスコア付きPNGを保存する")
+    parser.add_argument(
+        "--examples_dir",
+        type=Path,
+        default=None,
+        help="指定すると評価パッチのスコア付きPNGを保存する",
+    )
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -193,7 +207,9 @@ def main():
         sim_hdr_list += list(value["img_hdr_list"])
     sim_hdr_list = sorted(sim_hdr_list)[: args.max_volumes]
     real_hdr_list = collect_hdr_list(args.real_dir, args.max_volumes)
-    logging.info(f"sim volumes: {len(sim_hdr_list)}, real volumes: {len(real_hdr_list)}")
+    logging.info(
+        f"sim volumes: {len(sim_hdr_list)}, real volumes: {len(real_hdr_list)}"
+    )
 
     # MRは正規化用のintensityファイルを事前計算する
     if cfg.image.modality == "MR":
@@ -219,7 +235,10 @@ def main():
         for hdr_path in hdr_list:
             chunks.append(
                 extract_patches(
-                    hdr_path, cfg, args.patch_size, args.patches_per_volume,
+                    hdr_path,
+                    cfg,
+                    args.patch_size,
+                    args.patches_per_volume,
                     degrade_fn=degrade,
                 )
             )
@@ -298,15 +317,23 @@ def main():
     print(f"  mode: {cfg.data.mode}")
     print(f"  accuracy: {acc:.3f}  (0.5に近いほどギャップ小)")
     print(f"  AUC:      {auc:.3f}")
-    print(f"  mean score  sim: {sim_mean:.3f} / real: {real_mean:.3f} (real=1が正解ラベル)")
+    print(
+        f"  mean score  sim: {sim_mean:.3f} / real: {real_mean:.3f} (real=1が正解ラベル)"
+    )
     if acc < 0.6:
-        print("  → 分布ギャップはほぼありません。シミュレーションは実劣化をよく再現しています")
+        print(
+            "  → 分布ギャップはほぼありません。シミュレーションは実劣化をよく再現しています"
+        )
     elif acc < 0.85:
-        print("  → 軽微なギャップがあります。calibrate_degradation.pyでの校正や"
-              "劣化パラメータ範囲の拡大を検討してください")
+        print(
+            "  → 軽微なギャップがあります。calibrate_degradation.pyでの校正や"
+            "劣化パラメータ範囲の拡大を検討してください"
+        )
     else:
-        print("  → 明確なギャップがあります。校正で改善しない場合は劣化生成の学習や"
-              "実データのdata consistency損失の導入を検討してください")
+        print(
+            "  → 明確なギャップがあります。校正で改善しない場合は劣化生成の学習や"
+            "実データのdata consistency損失の導入を検討してください"
+        )
 
     if args.examples_dir is not None:
         args.examples_dir.mkdir(parents=True, exist_ok=True)

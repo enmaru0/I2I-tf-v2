@@ -38,7 +38,7 @@ class RegressionTrainer(BaseI2ITrainer):
             scaled_loss = self._scale_loss_for_optimizer(total_loss, self.optimizer)
         trainable_weights = self.generator.trainable_variables
         gradients = tape.gradient(scaled_loss, trainable_weights)
-        self.optimizer.apply_gradients(zip(gradients, trainable_weights))
+        self._apply_gradients(self.optimizer, gradients, trainable_weights)
 
         return self._get_metrics_result()
 

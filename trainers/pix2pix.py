@@ -20,18 +20,14 @@ class Pix2PixTrainer(BaseI2ITrainer):
     （trainers/__init__.pyのbuild_trainerで行う）。
     """
 
-    METRIC_NAMES = [
-        "l1_loss",
-        "g_adv_loss",
-        "g_total_loss",
-        "d_loss",
-        "psnr",
-        "ssim",
-    ]
+    METRIC_NAMES = ["l1_loss", "g_adv_loss", "g_total_loss", "d_loss", "psnr", "ssim"]
 
     def __init__(self, generator: Model, discriminator: Model, **kwargs):
         super().__init__(generator, **kwargs)
         self.discriminator = discriminator
+        self._create_gradient_accumulators(
+            "discriminator", self.discriminator.trainable_variables
+        )
         # 復元(restore)時はd_optimizerの状態は引き継がれないので注意
         self.d_optimizer = None
 
@@ -44,9 +40,7 @@ class Pix2PixTrainer(BaseI2ITrainer):
 
     @classmethod
     def from_config(cls, config):
-        config["generator"] = keras.saving.deserialize_keras_object(
-            config["generator"]
-        )
+        config["generator"] = keras.saving.deserialize_keras_object(config["generator"])
         config["discriminator"] = keras.saving.deserialize_keras_object(
             config["discriminator"]
         )
@@ -86,7 +80,9 @@ class Pix2PixTrainer(BaseI2ITrainer):
             g_total = self._add_real_dc_loss(g_total, data)
             g_scaled = self._scale_loss_for_optimizer(g_total, self.optimizer)
         g_grads = g_tape.gradient(g_scaled, self.generator.trainable_variables)
-        self.optimizer.apply_gradients(zip(g_grads, self.generator.trainable_variables))
+        self._apply_gradients(
+            self.optimizer, g_grads, self.generator.trainable_variables
+        )
 
         # --- Discriminatorの更新 ---
         # generatorのforwardは再利用し、勾配だけ止める
@@ -100,8 +96,11 @@ class Pix2PixTrainer(BaseI2ITrainer):
             )
             d_scaled = self._scale_loss_for_optimizer(d_loss, self.d_optimizer)
         d_grads = d_tape.gradient(d_scaled, self.discriminator.trainable_variables)
-        self.d_optimizer.apply_gradients(
-            zip(d_grads, self.discriminator.trainable_variables)
+        self._apply_gradients(
+            self.d_optimizer,
+            d_grads,
+            self.discriminator.trainable_variables,
+            key="discriminator",
         )
 
         # --- メトリクスの更新 ---
@@ -120,8 +119,7 @@ class Pix2PixTrainer(BaseI2ITrainer):
         d_real = self.discriminator([src_imgs, tgt_imgs], training=False)
         g_adv = self._gan_loss(d_fake, is_real=True)
         d_loss = 0.5 * (
-            self._gan_loss(d_real, is_real=True)
-            + self._gan_loss(d_fake, is_real=False)
+            self._gan_loss(d_real, is_real=True) + self._gan_loss(d_fake, is_real=False)
         )
         l1 = masked_l1_loss(tgt_imgs, preds, img_msks)
         g_total = cfg_p2p.l1_weight * l1 + cfg_p2p.gan_weight * g_adv

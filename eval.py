@@ -14,7 +14,16 @@ from main import gpu_setting, prepare_data_dict
 from trainers import attach_aux_optimizers
 
 # サンプリングステップ数(num_steps)を持つ生成系アルゴリズム
-GENERATIVE = {"edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0", "resshift", "split_mean_flow"}
+GENERATIVE = {
+    "edm",
+    "edm_karras",
+    "conditional_restoration_ode",
+    "rectified_flow",
+    "i2i_rfr",
+    "i2i_rfr_x0",
+    "resshift",
+    "split_mean_flow",
+}
 
 
 def evaluate_once(model, val_loader, max_batches: int, seed: int):
@@ -87,10 +96,7 @@ if __name__ == "__main__":
     checkpoint_path: Path = args.checkpoint_path
     cfg = OmegaConf.load(checkpoint_path.parents[1] / "output.yaml")
     if "reproducibility" not in cfg:
-        cfg.reproducibility = {
-            "seed": args.seed,
-            "fixed_validation_noise": True,
-        }
+        cfg.reproducibility = {"seed": args.seed, "fixed_validation_noise": True}
     else:
         cfg.reproducibility.seed = args.seed
     gpu_setting(args.gpu, cfg.gpu_allow_growth)
@@ -119,7 +125,9 @@ if __name__ == "__main__":
         steps_list = [None]  # 生成系でない場合はnum_stepsは無関係
 
     print(f"\n=== Evaluation: {name} (step {step}) ===")
-    header = f"{'num_steps':>10} | {'PSNR':>7} | {'SSIM':>7} | {'MAE':>7} | {'#case':>6}"
+    header = (
+        f"{'num_steps':>10} | {'PSNR':>7} | {'SSIM':>7} | {'MAE':>7} | {'#case':>6}"
+    )
     print(header)
     print("-" * len(header))
     results = []
@@ -157,6 +165,5 @@ if __name__ == "__main__":
             ],
         }
         args.output_json.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )

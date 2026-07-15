@@ -25,7 +25,16 @@ from losses import masked_psnr_per_sample, ssim_per_sample
 from main import gpu_setting, prepare_data_dict
 from trainers import attach_aux_optimizers
 
-GENERATIVE = {"edm", "rectified_flow", "i2i_rfr", "i2i_rfr_x0", "resshift", "split_mean_flow"}
+GENERATIVE = {
+    "edm",
+    "edm_karras",
+    "conditional_restoration_ode",
+    "rectified_flow",
+    "i2i_rfr",
+    "i2i_rfr_x0",
+    "resshift",
+    "split_mean_flow",
+}
 
 
 def sharpness(vol_zyx, msk_zyx):
@@ -88,10 +97,7 @@ if __name__ == "__main__":
         ckpt = Path(ckpt_str)
         cfg = OmegaConf.load(ckpt.parents[1] / "output.yaml")
         if "reproducibility" not in cfg:
-            cfg.reproducibility = {
-                "seed": args.seed,
-                "fixed_validation_noise": True,
-            }
+            cfg.reproducibility = {"seed": args.seed, "fixed_validation_noise": True}
         else:
             cfg.reproducibility.seed = args.seed
         name = cfg.algorithm.name
@@ -115,9 +121,7 @@ if __name__ == "__main__":
             _, preds, _, tgt, msk = model.predict_step(batch, return_aux=True)
             preds_np, tgt_np, msk_np = preds.numpy(), tgt.numpy(), msk.numpy()
 
-            psnrs.extend(
-                masked_psnr_per_sample(tgt, preds, msk).numpy().tolist()
-            )
+            psnrs.extend(masked_psnr_per_sample(tgt, preds, msk).numpy().tolist())
             ssims.extend(
                 ssim_per_sample(
                     tgt,

@@ -3,7 +3,10 @@ import keras
 from models import build_patch_discriminator, build_unet
 
 from .base import BaseI2ITrainer
+from .cac_regression import CACRegressionTrainer
+from .conditional_restoration_ode import ConditionalRestorationODETrainer
 from .edm import EDMTrainer
+from .edm_karras import EDMKarrasTrainer
 from .i2i_rfr import I2IRFRTrainer
 from .i2i_rfr_x0 import I2IRFRX0Trainer
 from .pix2pix import Pix2PixTrainer
@@ -15,8 +18,11 @@ from .split_mean_flow import SplitMeanFlowTrainer
 # アルゴリズムを追加したらここに登録する
 MODEL_REGISTRY = {
     "regression": RegressionTrainer,
+    "cac_regression": CACRegressionTrainer,
     "pix2pix": Pix2PixTrainer,
     "edm": EDMTrainer,
+    "edm_karras": EDMKarrasTrainer,
+    "conditional_restoration_ode": ConditionalRestorationODETrainer,
     "rectified_flow": RectifiedFlowTrainer,
     "i2i_rfr": I2IRFRTrainer,
     "i2i_rfr_x0": I2IRFRX0Trainer,
@@ -31,6 +37,8 @@ MODEL_REGISTRY = {
 # split_mean_flow: [x_t, source, 開始時刻t, 終了時刻s]
 GENERATOR_IN_CH = {
     "edm": 3,
+    "edm_karras": 3,
+    "conditional_restoration_ode": 3,
     "rectified_flow": 3,
     "i2i_rfr": 3,
     "i2i_rfr_x0": 3,
@@ -47,12 +55,12 @@ def attach_aux_optimizers(trainer: BaseI2ITrainer, cfg) -> None:
     if cfg.algorithm.name == "pix2pix":
         cfg_d = cfg.algorithm.pix2pix.d_optimizer
         d_optimizer = keras.optimizers.Adam(
-            learning_rate=cfg_d.lr,
-            beta_1=cfg_d.beta_1,
-            clipvalue=cfg_d.clip_value,
+            learning_rate=cfg_d.lr, beta_1=cfg_d.beta_1, clipvalue=cfg_d.clip_value
         )
         if keras.mixed_precision.global_policy().name == "mixed_float16":
             d_optimizer = keras.mixed_precision.LossScaleOptimizer(d_optimizer)
+        if hasattr(d_optimizer, "build"):
+            d_optimizer.build(trainer.discriminator.trainable_variables)
         trainer.d_optimizer = d_optimizer
 
 
@@ -62,6 +70,7 @@ def build_trainer(cfg, input_shape) -> BaseI2ITrainer:
     トレーナーを返す。cfgもここでセットする。
     """
     name = cfg.algorithm.name
+    gradient_accumulation_steps = int(cfg.get("gradient_accumulation_steps", 1))
 
     in_ch = GENERATOR_IN_CH.get(name, 1)
     gen_input_shape = tuple(input_shape[:3]) + (in_ch,)
@@ -70,24 +79,54 @@ def build_trainer(cfg, input_shape) -> BaseI2ITrainer:
     )
 
     if name == "regression":
-        trainer = RegressionTrainer(generator)
+        trainer = RegressionTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
+    elif name == "cac_regression":
+        trainer = CACRegressionTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     elif name == "pix2pix":
         discriminator = build_patch_discriminator(
             input_shape, **cfg.algorithm.pix2pix.discriminator
         )
-        trainer = Pix2PixTrainer(generator, discriminator)
+        trainer = Pix2PixTrainer(
+            generator,
+            discriminator,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
     elif name == "edm":
-        trainer = EDMTrainer(generator)
+        trainer = EDMTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
+    elif name == "edm_karras":
+        trainer = EDMKarrasTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
+    elif name == "conditional_restoration_ode":
+        trainer = ConditionalRestorationODETrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     elif name == "rectified_flow":
-        trainer = RectifiedFlowTrainer(generator)
+        trainer = RectifiedFlowTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     elif name == "i2i_rfr":
-        trainer = I2IRFRTrainer(generator)
+        trainer = I2IRFRTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     elif name == "i2i_rfr_x0":
-        trainer = I2IRFRX0Trainer(generator)
+        trainer = I2IRFRX0Trainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     elif name == "resshift":
-        trainer = ResShiftTrainer(generator)
+        trainer = ResShiftTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     elif name == "split_mean_flow":
-        trainer = SplitMeanFlowTrainer(generator)
+        trainer = SplitMeanFlowTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     else:
         raise NotImplementedError(
             f"Unknown algorithm: {name}. Available: {list(MODEL_REGISTRY.keys())}"
@@ -103,6 +142,8 @@ __all__ = [
     "RegressionTrainer",
     "Pix2PixTrainer",
     "EDMTrainer",
+    "EDMKarrasTrainer",
+    "ConditionalRestorationODETrainer",
     "RectifiedFlowTrainer",
     "I2IRFRTrainer",
     "I2IRFRX0Trainer",

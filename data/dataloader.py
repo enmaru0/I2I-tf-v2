@@ -88,6 +88,239 @@ def apply_motion_blur(img: np.ndarray, direction_zyx, length: float) -> np.ndarr
     return out.astype(np.float32, copy=False)
 
 
+def apply_random_contrast_augmentation(
+    images: list[np.ndarray],
+    cfg_contrast,
+    rng=None,
+    reference_index: int = 0,
+    mask: np.ndarray | None = None,
+) -> list[np.ndarray]:
+    """同じ単調contrast変換をclean/source/targetへ共有して適用する。"""
+    rng = np.random.default_rng() if rng is None else rng
+    outputs = [np.asarray(image, dtype=np.float32) for image in images]
+    if not bool(cfg_contrast.get("enabled", False)):
+        return outputs
+    if rng.random() >= float(cfg_contrast.get("p_apply", 0.5)):
+        return outputs
+
+    reference = outputs[reference_index]
+    valid = np.isfinite(reference)
+    if mask is not None:
+        valid &= np.asarray(mask) > 0
+    finite = reference[valid]
+    if finite.size == 0:
+        return outputs
+    percentile_range = cfg_contrast.get("percentile_range", [1.0, 99.0])
+    lo, hi = np.percentile(finite, percentile_range)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = float(np.nanmin(finite)), float(np.nanmax(finite))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return outputs
+
+    gamma = float(rng.uniform(*cfg_contrast.get("gamma_range", [0.75, 1.35])))
+    scale = float(rng.uniform(*cfg_contrast.get("scale_range", [0.85, 1.2])))
+    shift = float(rng.uniform(*cfg_contrast.get("shift_range", [-0.08, 0.08])))
+    invert = rng.random() < float(cfg_contrast.get("invert_prob", 0.0))
+
+    bias_field = None
+    if rng.random() < float(cfg_contrast.get("bias_field_prob", 0.0)):
+        sigma = float(
+            rng.uniform(*cfg_contrast.get("bias_field_sigma_range", [16.0, 64.0]))
+        )
+        smooth = gaussian_filter(rng.normal(size=reference.shape), sigma=sigma)
+        smooth = smooth - float(smooth.mean())
+        smooth_std = float(smooth.std())
+        if smooth_std > 1e-6:
+            smooth = smooth / smooth_std
+        smooth = np.clip(smooth / 3.0, -1.0, 1.0)
+        bias_scale = float(
+            rng.uniform(*cfg_contrast.get("bias_field_scale_range", [0.9, 1.1]))
+        )
+        log_amplitude = abs(np.log(bias_scale))
+        if log_amplitude > 0.0:
+            bias_field = np.exp(smooth * log_amplitude).astype(np.float32)
+
+    intensity_range = max(float(hi - lo), 1e-6)
+    transformed = []
+    for image in outputs:
+        value = np.clip((image - lo) / intensity_range, 0.0, 1.0)
+        if invert:
+            value = 1.0 - value
+        value = np.power(value, gamma)
+        if bias_field is not None and bias_field.shape == value.shape:
+            value = value * bias_field
+        value = np.clip((value - 0.5) * scale + 0.5 + shift, 0.0, 1.0)
+        transformed.append((value * intensity_range + lo).astype(np.float32))
+    return transformed
+
+
+def _correlated_noise(shape, sigma: float, grain_sigma: float, rng) -> np.ndarray:
+    noise = rng.normal(size=shape).astype(np.float32)
+    if grain_sigma > 0.01:
+        noise = gaussian_filter(noise, sigma=(0.0, grain_sigma, grain_sigma))
+        noise_std = float(noise.std())
+        if noise_std > 1e-10:
+            noise = noise / noise_std
+    return (noise * sigma).astype(np.float32, copy=False)
+
+
+def simulate_rician_noise(
+    clean: np.ndarray, sigma: float, grain_sigma: float = 0.0, rng=None
+) -> np.ndarray:
+    """MRI magnitude画像のRician noiseを生成する。"""
+    rng = np.random.default_rng() if rng is None else rng
+    n1 = _correlated_noise(clean.shape, sigma, grain_sigma, rng)
+    n2 = _correlated_noise(clean.shape, sigma, grain_sigma, rng)
+    magnitude = np.clip(clean, 0.0, None)
+    return np.sqrt((magnitude + n1) ** 2 + n2**2).astype(np.float32)
+
+
+def _kspace_truncate_2d(image: np.ndarray, keep_fraction: float) -> np.ndarray:
+    if keep_fraction >= 1.0:
+        return image.astype(np.float32, copy=False)
+    spectrum = np.fft.fftshift(np.fft.fft2(image))
+    ny, nx = image.shape
+    keep_y = max(1, int(ny * keep_fraction / 2.0))
+    keep_x = max(1, int(nx * keep_fraction / 2.0))
+    center_y, center_x = ny // 2, nx // 2
+    mask = np.zeros((ny, nx), dtype=bool)
+    mask[
+        center_y - keep_y : center_y + keep_y, center_x - keep_x : center_x + keep_x
+    ] = True
+    spectrum[~mask] = 0
+    return np.abs(np.fft.ifft2(np.fft.ifftshift(spectrum))).astype(np.float32)
+
+
+def simulate_kspace_noise(
+    clean: np.ndarray, sigma_image: float, resolution_reduction: float = 0.0, rng=None
+) -> np.ndarray:
+    """slice-wise 2D FFT上で帯域制限とcomplex Gaussian noiseを適用する。"""
+    rng = np.random.default_rng() if rng is None else rng
+    keep_fraction = float(np.clip(1.0 - resolution_reduction, 1e-3, 1.0))
+    outputs = []
+    for image in clean.astype(np.float32, copy=False):
+        if keep_fraction < 1.0 - 1e-4:
+            image = _kspace_truncate_2d(image, keep_fraction)
+        spectrum = np.fft.fft2(image.astype(np.float64))
+        ny, nx = image.shape
+        sigma_k = float(sigma_image) * np.sqrt(ny * nx)
+        complex_noise = (
+            rng.normal(size=(ny, nx)) + 1j * rng.normal(size=(ny, nx))
+        ) * sigma_k
+        outputs.append(np.abs(np.fft.ifft2(spectrum + complex_noise)))
+    return np.stack(outputs).astype(np.float32)
+
+
+def _sample_config_value(value, rng) -> float:
+    if isinstance(value, (list, tuple)) or (
+        hasattr(value, "__len__") and not isinstance(value, str)
+    ):
+        if len(value) != 2:
+            raise ValueError(f"rangeは[min, max]で指定してください: {value}")
+        return float(rng.uniform(float(value[0]), float(value[1])))
+    return float(value)
+
+
+def _resize_2d(image: np.ndarray, shape_yx) -> np.ndarray:
+    """bilinear resize後にcrop/padして出力shapeを厳密に合わせる。"""
+    shape_yx = tuple(int(v) for v in shape_yx)
+    output = zoom(
+        image,
+        (shape_yx[0] / image.shape[0], shape_yx[1] / image.shape[1]),
+        order=1,
+        prefilter=False,
+        mode="nearest",
+    )
+    output = output[: shape_yx[0], : shape_yx[1]]
+    pad_y = shape_yx[0] - output.shape[0]
+    pad_x = shape_yx[1] - output.shape[1]
+    if pad_y > 0 or pad_x > 0:
+        output = np.pad(output, ((0, pad_y), (0, pad_x)), mode="edge")
+    return output.astype(np.float32, copy=False)
+
+
+def _sample_lowfield_parameters(cfg_lowfield, rng, profile_name=None):
+    profiles = list(cfg_lowfield.get("profiles", []))
+    if profiles:
+        candidates = profiles
+        if profile_name:
+            candidates = [
+                profile
+                for profile in profiles
+                if str(profile.get("name", "")) == str(profile_name)
+            ]
+            if not candidates:
+                raise ValueError(f"lowfield profileが見つかりません: {profile_name}")
+        weights = np.asarray(
+            [float(profile.get("weight", 1.0)) for profile in candidates],
+            dtype=np.float64,
+        )
+        weights = weights / weights.sum()
+        profile = candidates[int(rng.choice(len(candidates), p=weights))]
+        return (
+            _sample_config_value(profile.get("target_snr"), rng),
+            _sample_config_value(profile.get("downsample"), rng),
+            _sample_config_value(profile.get("noise_corr_mm"), rng),
+            _sample_config_value(profile.get("kspace_keep"), rng),
+        )
+    return (
+        float(rng.uniform(cfg_lowfield.target_snr_min, cfg_lowfield.target_snr_max)),
+        float(rng.uniform(cfg_lowfield.downsample_min, cfg_lowfield.downsample_max)),
+        float(rng.uniform(0.0, cfg_lowfield.noise_corr_mm_max)),
+        float(rng.uniform(cfg_lowfield.kspace_keep_min, cfg_lowfield.kspace_keep_max)),
+    )
+
+
+def simulate_lowfield_noise(
+    clean: np.ndarray, spacing_zyx, cfg_lowfield, rng=None, profile_name=None
+) -> np.ndarray:
+    """SNR・面内解像度・noise相関・k-space帯域を連動させるlow-field模擬。"""
+    rng = np.random.default_rng() if rng is None else rng
+    target_snr, downsample, noise_corr_mm, kspace_keep = _sample_lowfield_parameters(
+        cfg_lowfield, rng, profile_name=profile_name
+    )
+    target_snr = max(float(target_snr), 1e-3)
+    downsample = float(np.clip(downsample, 1e-3, 1.0))
+    kspace_keep = float(np.clip(kspace_keep, 1e-3, 1.0))
+
+    positive = np.clip(clean, 0.0, None)
+    threshold = np.percentile(positive, 60.0)
+    foreground = positive[positive > threshold]
+    signal = (
+        float(np.median(foreground))
+        if foreground.size > 0
+        else float(positive.max() + 1e-8)
+    )
+    sigma = signal / target_snr
+    spacing_xy = float(np.mean(np.asarray(spacing_zyx, dtype=np.float32)[1:]))
+    corr_fwhm_px = max(float(noise_corr_mm), 0.0) / (spacing_xy + 1e-8)
+
+    outputs = []
+    for image in clean.astype(np.float32, copy=False):
+        if kspace_keep < 1.0 - 1e-4:
+            image = _kspace_truncate_2d(image, kspace_keep)
+        if downsample < 1.0 - 1e-4:
+            anti_alias_sigma = (1.0 / downsample) / 2.3548
+            image = gaussian_filter(image, sigma=anti_alias_sigma)
+            small_shape = (
+                max(1, int(round(image.shape[0] * downsample))),
+                max(1, int(round(image.shape[1] * downsample))),
+            )
+            small = _resize_2d(image, small_shape)
+            grain_sigma = corr_fwhm_px * downsample / 2.3548
+            n1 = _correlated_noise((1,) + small.shape, sigma, grain_sigma, rng)[0]
+            n2 = _correlated_noise((1,) + small.shape, sigma, grain_sigma, rng)[0]
+            small = np.sqrt((np.clip(small, 0.0, None) + n1) ** 2 + n2**2)
+            image = _resize_2d(small, clean.shape[1:])
+        else:
+            grain_sigma = corr_fwhm_px / 2.3548
+            image = simulate_rician_noise(
+                image[None], sigma, grain_sigma=grain_sigma, rng=rng
+            )[0]
+        outputs.append(image)
+    return np.stack(outputs).astype(np.float32)
+
+
 # through-plane SRの劣化軸（データはz,y,x順）: AX=z / COR=y / SAG=x
 SR_AXIS_TO_DIM = {"AX": 0, "COR": 1, "SAG": 2}
 CONTINUOUS_SR_SIGMA_FACTOR = 0.32
@@ -135,10 +368,7 @@ def _resize_axis0(
 
 
 def _sample_axis0(
-    vol: np.ndarray,
-    interval_px: float,
-    phase_px: int = 0,
-    order: int = 1,
+    vol: np.ndarray, interval_px: float, phase_px: int = 0, order: int = 1
 ) -> tuple[np.ndarray, np.ndarray]:
     """PSF適用済みvolumeを規則的なスライス中心で標本化する。"""
     n_axis = int(vol.shape[0])
@@ -161,11 +391,7 @@ def _sample_axis0(
 
 
 def _reconstruct_axis0(
-    samples: np.ndarray,
-    positions: np.ndarray,
-    out_n: int,
-    order: int,
-    prefilter: bool,
+    samples: np.ndarray, positions: np.ndarray, out_n: int, order: int, prefilter: bool
 ) -> np.ndarray:
     """低解像度スライス列をzoomで密なグリッドへ戻し、観測外は端値で補う。"""
     out_n = int(out_n)
@@ -233,40 +459,132 @@ def simulate_through_plane_sr(
 
     n_axis = axis_first.shape[0]
     lowres, positions = _sample_axis0(
-        axis_first,
-        interval_px,
-        phase_px=slice_phase_px,
-        order=acquisition_order,
+        axis_first, interval_px, phase_px=slice_phase_px, order=acquisition_order
     )
     upsampled = _reconstruct_axis0(
-        lowres,
-        positions,
-        n_axis,
-        interpolation_order,
-        interpolation_prefilter,
+        lowres, positions, n_axis, interpolation_order, interpolation_prefilter
     )
     return np.moveaxis(upsampled, 0, axis_dim).astype(np.float32, copy=False)
 
 
-def apply_random_self_noise(
-    clean: np.ndarray, intensity_range: float, cfg_sn, rng=None
+def _apply_self_noise(
+    clean: np.ndarray,
+    intensity_range: float,
+    cfg_sn,
+    rng,
+    is_training: bool,
+    norm_spacing_zyx=(1.0, 1.0, 1.0),
 ) -> np.ndarray:
-    """
-    self_noiseの学習時ランダム劣化（モーションブラー→ぼかし→ノイズの順）。
-    学習ローダとprobe_sim2real.pyの両方から使う。
-    """
+    degraded = clean.astype(np.float32, copy=False)
+    motion_length = (
+        float(rng.uniform(*cfg_sn.motion_blur.length_range))
+        if is_training and rng.random() < float(cfg_sn.motion_blur.prob)
+        else float(cfg_sn.motion_blur.get("val_length", 0.0))
+        if not is_training
+        else 0.0
+    )
+    if motion_length > 0.0:
+        degraded = apply_motion_blur(degraded, rng.normal(size=3), motion_length)
+
+    blur_sigma = (
+        float(rng.uniform(*cfg_sn.blur_sigma_range))
+        if is_training and rng.random() < float(cfg_sn.blur_prob)
+        else float(cfg_sn.get("val_blur_sigma", 0.0))
+        if not is_training
+        else 0.0
+    )
+    if blur_sigma > 0.0:
+        degraded = gaussian_filter(degraded, sigma=blur_sigma)
+
+    noise_std_rel = (
+        float(rng.uniform(*cfg_sn.noise_std_rel_range))
+        if is_training
+        else float(cfg_sn.val_noise_std_rel)
+    )
+    simulation = str(cfg_sn.get("simulation", "gaussian")).lower()
+    if simulation == "gaussian":
+        noise = rng.normal(0.0, noise_std_rel * intensity_range, degraded.shape).astype(
+            np.float32
+        )
+        return degraded + noise
+    if simulation == "rician":
+        cfg_rician = cfg_sn.get("rician", {})
+        signal_range = float(degraded.max() - degraded.min())
+        if signal_range < 1e-8:
+            signal_range = 1.0
+        grain_sigma = (
+            float(rng.uniform(*cfg_rician.get("grain_sigma_range", [0.0, 0.0])))
+            if is_training
+            else float(cfg_rician.get("val_grain_sigma", 0.0))
+        )
+        return simulate_rician_noise(
+            degraded, noise_std_rel * signal_range, grain_sigma=grain_sigma, rng=rng
+        )
+    if simulation == "kspace":
+        cfg_kspace = cfg_sn.get("kspace", {})
+        signal_range = float(degraded.max() - degraded.min())
+        if signal_range < 1e-8:
+            signal_range = 1.0
+        reduction = (
+            float(
+                rng.uniform(*cfg_kspace.get("resolution_reduction_range", [0.0, 0.0]))
+            )
+            if is_training
+            else float(cfg_kspace.get("val_resolution_reduction", 0.0))
+        )
+        return simulate_kspace_noise(
+            degraded,
+            noise_std_rel * signal_range,
+            resolution_reduction=reduction,
+            rng=rng,
+        )
+    if simulation == "lowfield":
+        cfg_lowfield = cfg_sn.lowfield
+        profile_name = None
+        if not is_training:
+            profile_name = cfg_lowfield.get("val_profile", None) or None
+        return simulate_lowfield_noise(
+            degraded, norm_spacing_zyx, cfg_lowfield, rng=rng, profile_name=profile_name
+        )
+    raise NotImplementedError(f"未知のdenoise simulation: {simulation}")
+
+
+def apply_random_self_noise(
+    clean: np.ndarray,
+    intensity_range: float,
+    cfg_sn,
+    rng=None,
+    norm_spacing_zyx=(1.0, 1.0, 1.0),
+) -> np.ndarray:
+    """denoise/self_noiseの学習時ランダム劣化を適用する。"""
     rng = np.random.default_rng() if rng is None else rng
-    degraded = clean.astype(np.float32)
-    if rng.uniform() < cfg_sn.motion_blur.prob:
-        length = rng.uniform(*cfg_sn.motion_blur.length_range)
-        direction = rng.normal(size=3)  # 一様ランダム方向
-        degraded = apply_motion_blur(degraded, direction, length)
-    if rng.uniform() < cfg_sn.blur_prob:
-        sigma = rng.uniform(*cfg_sn.blur_sigma_range)
-        degraded = gaussian_filter(degraded, sigma=sigma)
-    std_rel = rng.uniform(*cfg_sn.noise_std_rel_range)
-    noise = rng.normal(0.0, std_rel * intensity_range, degraded.shape)
-    return degraded + noise.astype(np.float32)
+    return _apply_self_noise(
+        clean,
+        intensity_range,
+        cfg_sn,
+        rng,
+        is_training=True,
+        norm_spacing_zyx=norm_spacing_zyx,
+    )
+
+
+def apply_validation_self_noise(
+    clean: np.ndarray,
+    intensity_range: float,
+    cfg_sn,
+    rng=None,
+    norm_spacing_zyx=(1.0, 1.0, 1.0),
+) -> np.ndarray:
+    """固定validationパラメータと症例seedで決定的なdenoise劣化を適用する。"""
+    rng = np.random.default_rng(0) if rng is None else rng
+    return _apply_self_noise(
+        clean,
+        intensity_range,
+        cfg_sn,
+        rng,
+        is_training=False,
+        norm_spacing_zyx=norm_spacing_zyx,
+    )
 
 
 def apply_random_self_sr(
@@ -279,8 +597,7 @@ def apply_random_self_sr(
     py_rng = random if py_rng is None else py_rng
     np_rng = np.random.default_rng() if np_rng is None else np_rng
     interpolation_order, interpolation_prefilter = _normalize_sr_interpolation(
-        cfg_sr.slice_interpolation,
-        cfg_sr.get("b_spline_order", 3),
+        cfg_sr.slice_interpolation, cfg_sr.get("b_spline_order", 3)
     )
     protocols = list(cfg_sr.get("protocols", []))
     if protocols:
@@ -298,9 +615,7 @@ def apply_random_self_sr(
     axis_dim = SR_AXIS_TO_DIM[axis_name]
     if cfg_sr.clamp_thickness_to_interval:
         slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
-    interval_px = max(
-        float(slice_interval_mm) / float(norm_spacing_zyx[axis_dim]), 1.0
-    )
+    interval_px = max(float(slice_interval_mm) / float(norm_spacing_zyx[axis_dim]), 1.0)
     phase_px = 0
     if bool(cfg_sr.get("random_slice_phase", False)):
         phase_px = int(np_rng.integers(0, max(1, int(np.ceil(interval_px)))))
@@ -313,9 +628,7 @@ def apply_random_self_sr(
         slice_profile=cfg_sr.slice_profile,
         interpolation_order=interpolation_order,
         interpolation_prefilter=interpolation_prefilter,
-        continuous_sigma_k=cfg_sr.get(
-            "continuous_sigma_k", CONTINUOUS_SR_SIGMA_FACTOR
-        ),
+        continuous_sigma_k=cfg_sr.get("continuous_sigma_k", CONTINUOUS_SR_SIGMA_FACTOR),
         acquisition_order=int(cfg_sr.get("acquisition_order", 1)),
         slice_phase_px=phase_px,
     )
@@ -373,17 +686,11 @@ def get_crop_center(
         if validation_patch_count > 1:
             z_min = float(cfg.aug.get("crop_exclude_start_slices", 0))
             z_max = float(img_size_zyx[0])
-            fraction = (validation_patch_index + 1.0) / (
-                validation_patch_count + 1.0
-            )
+            fraction = (validation_patch_index + 1.0) / (validation_patch_count + 1.0)
             center[0] = z_min + fraction * max(z_max - z_min, 0.0)
         # 固定位置（クロップが画像内に収まるように調整）
         return center_within_image(
-            center,
-            img_size_zyx,
-            crop_size_zyx,
-            spacing_zyx,
-            norm_spacing_zyx,
+            center, img_size_zyx, crop_size_zyx, spacing_zyx, norm_spacing_zyx
         )
 
     rng = random if rng is None else rng
@@ -395,15 +702,23 @@ def get_crop_center(
         # 体表マスクの矩形内でランダムクロップ（.body.box.txtはsave_organ_boxで作成）
         body_box_path = img_hdr_path.with_suffix(".body.box.txt")
         box_zyxzyx = load_organ_box(body_box_path)
+    elif mode == "cac":
+        # CAC専用configでのみ使用するopt-in動作。gated targetから事前作成した
+        # sidecarをsourceと同じ場所へ置き、陽性病変周囲をoversampleする。
+        cac_box_path = img_hdr_path.with_suffix(".cac.box.txt")
+        if not cac_box_path.exists():
+            raise FileNotFoundError(
+                f"CAC crop用sidecarがありません: {cac_box_path}\n"
+                "utils/prepare_cac_boxes.pyで事前作成してください。"
+            )
+        box_zyxzyx = load_organ_box(cac_box_path)
     elif mode == "image":
         # 画像全体からランダムクロップ
         box_zyxzyx = np.array([0, 0, 0] + list(img_size_zyx))
     else:
         raise NotImplementedError(mode)
 
-    box_zyxzyx = _apply_crop_exclude_start_slices(
-        box_zyxzyx, img_size_zyx, cfg.aug
-    )
+    box_zyxzyx = _apply_crop_exclude_start_slices(box_zyxzyx, img_size_zyx, cfg.aug)
     return random_crop_center_within_bb(
         box_zyxzyx,
         img_size_zyx,
@@ -416,10 +731,7 @@ def get_crop_center(
 
 
 def preprocess_image_np(
-    img_hdr_list_with_data_name: list[bytes],
-    sample_index: int,
-    is_training: bool,
-    cfg,
+    img_hdr_list_with_data_name: list[bytes], sample_index: int, is_training: bool, cfg
 ):
     src_hdr_path, dataname = img_hdr_list_with_data_name
     dataname = dataname.decode()
@@ -435,13 +747,13 @@ def preprocess_image_np(
     val_patch_count = max(1, int(cfg_eval.get("val_patches_per_volume", 1)))
     val_patch_index = 0 if is_training else int(sample_index) % val_patch_count
 
-    # self_noiseモード: クリーン画像を1枚だけ読み込み、targetはクリーン、
+    # denoise/self_noiseモード: クリーン画像を1枚だけ読み込み、targetはクリーン、
     #   sourceはクリーン+合成ノイズとする（自己教師デノイジング）
     # self_srモード: クリーン画像を1枚だけ読み込み、targetはクリーン、
     #   sourceはスライス方向の低解像度シミュレーション（through-plane SR）
     # pairedモード: source(xxx.hdr)とtarget(xxx.target.hdr)を同一フォルダから読む
     # paired_dirモード: source(data_dir)とtarget(target_data_dir)を別フォルダの同名ファイルから読む
-    self_noise = cfg.data.mode == "self_noise"
+    self_noise = cfg.data.mode in ("self_noise", "denoise")
     self_sr = cfg.data.mode == "self_sr"
 
     # 画像リサンプルの補間次数（回転による面内ボケを抑えるためcubic推奨）。マスクは常に0
@@ -508,35 +820,51 @@ def preprocess_image_np(
     if self_noise:
         # クリーン画像を1回だけアフィン変換し、targetとする
         clean = affine_transform.apply(src_img, affine_matrix, order=img_interp_order)
+        if is_training and cfg.image.modality == "MR":
+            clean = apply_random_contrast_augmentation(
+                [clean],
+                cfg.data.get("contrast_augmentation", {}),
+                rng=np_rng,
+                mask=img_msk,
+            )[0]
         tgt_img = clean
         # sourceは劣化画像: モーションブラー→ガウシアンぼかし→ノイズの順に加える
         # ノイズ量は強度レンジ(正規化min-max)に対する相対量で指定する
         cfg_sn = cfg.data.self_noise
         intensity_range = float(src_max_val - src_min_val)
+        norm_spacing_zyx = cfg.aug.affine.norm_spacing_zyx
         if is_training:
             # 学習時は劣化をランダムに適用（probe_sim2real.pyと共通の関数）
-            src_img = apply_random_self_noise(clean, intensity_range, cfg_sn, rng=np_rng)
+            src_img = apply_random_self_noise(
+                clean,
+                intensity_range,
+                cfg_sn,
+                rng=np_rng,
+                norm_spacing_zyx=norm_spacing_zyx,
+            )
         else:
-            degraded = clean.astype(np.float32)
             # 検証はエポック間・実行間で再現するようファイル名でシードを固定する
             # （組み込みhashはプロセス毎に変わるためcrc32を使う）
             seed = zlib.crc32(src_hdr_path.stem.encode())
             rng = np.random.default_rng(seed)
-            # 検証は固定の劣化（代表的な劣化強度。ブレ方向はファイル毎に固定）
-            if cfg_sn.motion_blur.val_length > 0:
-                direction = rng.normal(size=3)
-                degraded = apply_motion_blur(
-                    degraded, direction, float(cfg_sn.motion_blur.val_length)
-                )
-            if cfg_sn.val_blur_sigma > 0:
-                degraded = gaussian_filter(degraded, sigma=float(cfg_sn.val_blur_sigma))
-            std_rel = float(cfg_sn.val_noise_std_rel)
-            noise = rng.normal(0.0, std_rel * intensity_range, degraded.shape)
-            src_img = degraded + noise.astype(np.float32)
+            src_img = apply_validation_self_noise(
+                clean,
+                intensity_range,
+                cfg_sn,
+                rng=rng,
+                norm_spacing_zyx=norm_spacing_zyx,
+            )
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     elif self_sr:
         # クリーン画像を1回だけアフィン変換し、targetとする
         clean = affine_transform.apply(src_img, affine_matrix, order=img_interp_order)
+        if is_training and cfg.image.modality == "MR":
+            clean = apply_random_contrast_augmentation(
+                [clean],
+                cfg.data.get("contrast_augmentation", {}),
+                rng=np_rng,
+                mask=img_msk,
+            )[0]
         tgt_img = clean
         # sourceはスライス方向の低解像度シミュレーション
         # アフィン変換後のボクセル間隔はnorm_spacing_zyxになっている
@@ -555,8 +883,7 @@ def preprocess_image_np(
             if cfg_sr.clamp_thickness_to_interval:
                 slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
             interpolation_order, interpolation_prefilter = _normalize_sr_interpolation(
-                cfg_sr.slice_interpolation,
-                cfg_sr.get("b_spline_order", 3),
+                cfg_sr.slice_interpolation, cfg_sr.get("b_spline_order", 3)
             )
             src_img = simulate_through_plane_sr(
                 clean,
@@ -612,6 +939,15 @@ def preprocess_image_np(
                 axis=thin2thick_param["axis"],
             )
             src_img = crop_input(src_img, [0, 0, 0] + list(crop_size_zyx))
+
+        if is_training and cfg.image.modality == "MR":
+            src_img, tgt_img = apply_random_contrast_augmentation(
+                [src_img, tgt_img],
+                cfg.data.get("contrast_augmentation", {}),
+                rng=np_rng,
+                reference_index=1,
+                mask=img_msk,
+            )
 
         if cfg.image.share_normalization:
             # デノイズ・ぼかし修正など同一モダリティ変換ではsourceと同じ値を使う
@@ -711,16 +1047,10 @@ def make_batch_dict(
     cfg_repro = cfg.get("reproducibility", {})
     base_seed = int(cfg_repro.get("seed", 0))
     id_hash = tf.strings.to_hash_bucket_strong(
-        img_hdr_list,
-        num_buckets=2**31 - 1,
-        key=[0x13579BDF, 0x2468ACE0],
+        img_hdr_list, num_buckets=2**31 - 1, key=[0x13579BDF, 0x2468ACE0]
     )
     sample_seeds = tf.stack(
-        [
-            tf.fill(tf.shape(id_hash), tf.cast(base_seed, tf.int64)),
-            id_hash,
-        ],
-        axis=-1,
+        [tf.fill(tf.shape(id_hash), tf.cast(base_seed, tf.int64)), id_hash], axis=-1
     )
 
     data = dict(
@@ -768,9 +1098,7 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
 
         def _run(func, path_list, desc):
             for _ in tqdm(
-                pool.imap_unordered(func, path_list),
-                total=len(path_list),
-                desc=desc,
+                pool.imap_unordered(func, path_list), total=len(path_list), desc=desc
             ):
                 pass
 
@@ -787,11 +1115,11 @@ def create_dataloader(img_hdr_dict: dict, is_training: bool, cfg):
                 max_percentile=cfg.image.MR.max_percentile,
             )
             _run(func, img_hdr_path_list, "saving source intensity")
-            # self_noise / self_srではtargetはsourceと同一なので別計算は不要
-            if cfg.data.mode not in (
-                "self_noise",
-                "self_sr",
-            ) and not cfg.image.share_normalization:
+            # denoise / self_noise / self_srではtargetはsourceと同一なので別計算は不要
+            if (
+                cfg.data.mode not in ("denoise", "self_noise", "self_sr")
+                and not cfg.image.share_normalization
+            ):
                 tgt_hdr_path_list = [
                     resolve_target_hdr_path(Path(p), cfg) for p in img_hdr_path_list
                 ]
@@ -909,7 +1237,9 @@ def preprocess_real_dc_image_np(hdr_path_bytes, sample_index, cfg):
 
     axis_dim = SR_AXIS_TO_DIM[str(cfg_dc.axis).upper()]
     interval_mm = cfg_dc.slice_interval_mm
-    interval_mm = float(spacing_zyx[axis_dim]) if interval_mm is None else float(interval_mm)
+    interval_mm = (
+        float(spacing_zyx[axis_dim]) if interval_mm is None else float(interval_mm)
+    )
     thickness_mm = cfg_dc.slice_thickness_mm
     thickness_mm = interval_mm if thickness_mm is None else float(thickness_mm)
     axis_spacing = float(cfg.aug.affine.norm_spacing_zyx[axis_dim])
@@ -923,9 +1253,7 @@ def preprocess_real_dc_image_np(hdr_path_bytes, sample_index, cfg):
 
     # ランダム中心クロップ（回転なしの決定的アフィン）
     box_zyxzyx = np.array([0, 0, 0] + list(img_size_zyx))
-    box_zyxzyx = _apply_crop_exclude_start_slices(
-        box_zyxzyx, img_size_zyx, cfg.aug
-    )
+    box_zyxzyx = _apply_crop_exclude_start_slices(box_zyxzyx, img_size_zyx, cfg.aug)
     crop_center_zyx = random_crop_center_within_bb(
         box_zyxzyx,
         img_size_zyx,
@@ -1118,14 +1446,11 @@ def create_test_batch(cfg):
     base_seed = int(cfg_repro.get("seed", 0))
     name_tensor = tf.constant(names, tf.string)
     id_hash = tf.strings.to_hash_bucket_strong(
-        name_tensor,
-        num_buckets=2**31 - 1,
-        key=[0x13579BDF, 0x2468ACE0],
+        name_tensor, num_buckets=2**31 - 1, key=[0x13579BDF, 0x2468ACE0]
     )
     data["sample_seeds"] = tf.cast(
         tf.stack(
-            [tf.fill(tf.shape(id_hash), tf.cast(base_seed, tf.int64)), id_hash],
-            axis=-1,
+            [tf.fill(tf.shape(id_hash), tf.cast(base_seed, tf.int64)), id_hash], axis=-1
         ),
         tf.int32,
     )

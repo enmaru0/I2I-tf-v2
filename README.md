@@ -6,15 +6,16 @@ TensorFlow/Keras 3で学習・比較するプロジェクト。
 
 ## データ形式
 
-`data.mode` で4種類のデータ供給方法を選べる（source/targetは位置合わせ済み＝同一サイズ・同一スペーシングが前提）。
+`data.mode` でデータ供給方法を選べる（source/targetは位置合わせ済み＝同一サイズ・同一スペーシングが前提）。
 ディレクトリ構成はいずれも `data_dir/{train,val}/<データセット名>/`。
 
 - **paired**（デフォルト）: 同一フォルダに source `xxx.hdr` と target `xxx.target.hdr`
   （サフィックスは `data.target_suffix` で変更可）
 - **paired_dir**: source は `data_dir`、target は `data.target_data_dir` の別フォルダに置き、
   **同名ファイル**（`{split}/{データセット名}/{同じ名前}.hdr`）をペアとする
-- **self_noise**: クリーン画像1枚から source=クリーン+合成劣化（ぼかし→ノイズ） / target=クリーン
-  を作る自己教師デノイジング（targetファイル不要。`data.self_noise.*` で劣化を設定）
+- **denoise**: クリーン画像1枚から source=合成劣化 / target=クリーンを作る自己教師デノイジング。
+  `data.self_noise.simulation` でGaussian、Rician、k-space、low-fieldを選択できる
+  （`self_noise`は後方互換の別名）
 - **self_sr**: PSFぼかし、低解像度スライス標本化、再補間からthrough-plane SRペアを合成
   （撮像条件は `data.self_sr.protocols` または範囲指定、スライス位相もランダム化可能）
 
@@ -26,6 +27,76 @@ python main.py --overrides exp_dir=results/pd \
     data.mode=paired_dir data_dir=noisy_root data.target_data_dir=clean_root
 ```
 
+## CAC non-gated → gated motion correction
+
+CAC専用設定は [`conf/config_cac.yaml`](conf/config_cac.yaml) に分離している。
+通常の`conf/config.yaml`は変更せず、`extends: config.yaml`で共通設定を継承する。
+3.0 mm（AX）×0.5 mm×0.5 mmのnative spacing、mixed U-Net、-1000～2000 HU、
+mixed precision、gradient accumulation、EMAを初期値とする。
+
+位置合わせ済み実ペアでは、最初にgated targetからCAC crop用sidecarを作る。
+
+```bash
+python utils/prepare_cac_boxes.py \
+    --source-dir /data/cac/non_gated \
+    --target-dir /data/cac/gated
+
+python main.py --config conf/config_cac.yaml --overrides \
+    exp_dir=results/cac_real \
+    data_dir=/data/cac/non_gated \
+    data.target_data_dir=/data/cac/gated
+```
+
+単一時相gated CTから合成ペアを事前生成する場合、入力は既存datasetと同じ
+`{train,val}/<dataset>/*.hdr`構造にする。
+
+```bash
+python utils/generate_cac_motion_dataset.py \
+    --config conf/config_cac.yaml \
+    --input-dir /data/cac/gated_clean \
+    --output-dir /data/cac/simulated \
+    --variants-per-case 3
+
+# 出力: simulated/source と simulated/target
+python main.py --config conf/config_cac.yaml --overrides \
+    exp_dir=results/cac_synthetic_pretrain \
+    data_dir=/data/cac/simulated/source \
+    data.target_data_dir=/data/cac/simulated/target
+```
+
+`data.cac_motion.simulator`は2種類ある。
+
+- `image_blend`: 複数の局所warp時相を平均する高速な画像領域近似。
+- `parallel_fbp`: viewごとに異なる時相をAX parallel-beam投影し、Poisson noiseと
+  FBP再構成を行う。angle依存streakを生成できるが、実scannerのcone/helical geometryを
+  完全には再現しない。学習中ではなく事前生成に使う。
+
+heart maskは画像と同じdirectoryのsidecar（`case.hdr`に対する
+`case.mask.hdr`）を自動で読み込む。別rootに置く場合は同じ相対directory構造で
+`case.mask.hdr`（または`case.heart.mask.hdr`）を配置し、`--heart-mask-dir`を渡す。
+旧仕様の同名`case.hdr`も外部mask rootに限り読み込める。maskが見つからず
+`--heart-mask-dir`も未指定の場合はconfigのsoft ellipsoidへfallbackするため、
+FOVや心臓位置が一定でないdatasetではsidecar maskの利用を推奨する。
+
+実ペアと合成ペアのCAC統計（130 HU mask Dice、体積比、peak HU比、重心距離、
+心臓ROI MAE）を比較してsimulatorを校正できる。
+
+```bash
+python utils/summarize_cac_pairs.py \
+    --source-dir /data/cac/non_gated \
+    --target-dir /data/cac/gated \
+    --output results/cac_real_pair_stats.json
+
+python utils/summarize_cac_pairs.py \
+    --source-dir /data/cac/simulated/source \
+    --target-dir /data/cac/simulated/target \
+    --output results/cac_simulated_pair_stats.json
+```
+
+推奨手順は、合成ペアで`cac_regression`をpretrainし、実ペアだけでfinetuneする方法。
+`cac_regression`は通常L1に加え、130 HU以上のtarget領域と0.5 mm面内edgeを重くする。
+これらの統計・lossは研究用であり、診断用Agatston score実装ではない。
+
 ## アルゴリズム
 
 `--overrides algorithm.name=<名前>` で切り替える。全アルゴリズムが同一のU-Netバックボーン・
@@ -34,8 +105,10 @@ python main.py --overrides exp_dir=results/pd \
 | algorithm.name | 手法 | 推論コスト | 備考 |
 |---|---|---|---|
 | `regression` | U-Net回帰 (L1/L2/SSIM損失) | 1 forward | ベースライン。residual/direct出力 |
+| `cac_regression` | CAC重み付き残差回帰 | 1 forward | 130 HU以上と面内edgeを追加監督。CAC専用configで使用 |
 | `pix2pix` | 条件付きGAN + L1 | 1 forward | 3D PatchGAN。optimizerはadamw推奨 |
-| `edm` | 拡散モデル (Karras 2022) | 2N-1 forwards | Heun/Euler、1 step対応 |
+| `edm_karras` | EDM (Karras 2022) | 2N-1 forwards | Heun/Euler、`edm`は後方互換名 |
+| `conditional_restoration_ode` | 条件付きrestoration ODE | 2N-1 forwards | PyTorch版の従来EDM目的関数を移植 |
 | `rectified_flow` | Rectified Flow / Flow Matching | N forwards | オイラー積分 |
 | `i2i_rfr` | source起点Rectified Flow | N forwards | source→targetを直接輸送する独自variant |
 | `i2i_rfr_x0` | I2I-RFR x0予測 | N forwards | ノイズ化targetからx0を予測 |
@@ -54,11 +127,11 @@ python main.py --overrides exp_dir=results/reg
 # 学習（他アルゴリズムの例）
 python main.py --overrides exp_dir=results/p2p algorithm.name=pix2pix \
     optimizer.name=adamw optimizer.adamw.max_lr=2e-4
-python main.py --overrides exp_dir=results/edm algorithm.name=edm \
+python main.py --overrides exp_dir=results/edm algorithm.name=edm_karras \
     optimizer.name=adamw optimizer.adamw.max_lr=2e-4
 
 # EMA（重みの指数移動平均）を有効にして学習（拡散/フロー系で推奨）
-python main.py --overrides exp_dir=results/edm algorithm.name=edm \
+python main.py --overrides exp_dir=results/edm algorithm.name=edm_karras \
     ema.enabled=True ema.decay=0.999 \
     optimizer.name=adamw optimizer.adamw.max_lr=2e-4
 
@@ -84,6 +157,13 @@ python compare_algorithms.py --exp_root results/compare \
 比較時は `reproducibility.seed` からcrop・劣化・生成初期ノイズを固定する。評価は症例単位の
 PSNR/MAEとz/y/x方向SSIMを使い、`evaluation.val_patches_per_volume` 個の固定パッチを取る。
 `mixed_precision_policy=mixed_float16` でloss scaling付きmixed precisionを有効化できる。
+`gradient_accumulation_steps=N` では`batch_size`をmicro batch sizeとして、N回の平均勾配で
+generator（pix2pixではdiscriminatorも）を1回更新する。`num_train_steps`と`eval_every`は
+従来どおりoptimizer更新回数であり、LR scheduleの意味は変わらない。
+
+MRIでは`data.contrast_augmentation.enabled=True`により、gamma/scale/shift/inversion/
+smooth bias fieldを劣化simulation前のcleanへ適用できる。pairedデータでは同じ変換を
+source/targetへ共有する。
 
 ## EMA（指数移動平均）
 
