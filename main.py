@@ -14,6 +14,7 @@ from keras.api.optimizers.schedules import CosineDecay
 from omegaconf import ListConfig, OmegaConf
 
 from callbacks import (
+    ConciseProgbarLogger,
     EMACallback,
     ImageLogger,
     TestImageLogger,
@@ -439,6 +440,7 @@ if __name__ == "__main__":
 
     # コールバックを組み立てる
     callbacks = [
+        ConciseProgbarLogger(),
         tensorboard_callback,
         image_logger_callback,
         best_checkpoint_callback,
@@ -464,4 +466,5 @@ if __name__ == "__main__":
         steps_per_epoch=cfg.eval_every,
         callbacks=callbacks,
         initial_epoch=initial_epoch,
+        verbose=0,
     )

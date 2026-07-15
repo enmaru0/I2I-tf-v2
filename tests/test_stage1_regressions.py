@@ -7,6 +7,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 import trainers.base as base_module
+from callbacks.concise_progbar import ConciseProgbarLogger
 from callbacks.image_logger import as_axis_list, axis_display_name, axis_section_name
 from data.dataloader import (
     _reconstruct_axis0,
@@ -23,6 +24,23 @@ from optimizer_utils import get_optimizer_iterations
 
 
 class Stage1RegressionTests(unittest.TestCase):
+    def test_concise_progbar_keeps_only_primary_metrics(self):
+        logs = {
+            "l1_loss": 1.0,
+            "psnr": 2.0,
+            "ssim": 3.0,
+            "total_loss": 4.0,
+            "val_l1_loss": 5.0,
+            "val_psnr": 6.0,
+            "val_ssim": 7.0,
+            "val_total_loss": 8.0,
+            "learning_rate": 9.0,
+        }
+        self.assertEqual(
+            list(ConciseProgbarLogger.filter_logs(logs)),
+            ["psnr", "ssim", "total_loss"],
+        )
+
     def test_tensorboard_axes_accept_anatomical_names(self):
         self.assertEqual(as_axis_list(["AX", "COR", "SAG"]), ["z", "y", "x"])
         self.assertEqual(as_axis_list(["z", "COR", "sagittal"]), ["z", "y", "x"])
