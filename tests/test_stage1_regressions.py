@@ -7,6 +7,7 @@ import numpy as np
 from omegaconf import OmegaConf
 
 import trainers.base as base_module
+from callbacks.image_logger import as_axis_list, axis_display_name, axis_section_name
 from data.dataloader import (
     _reconstruct_axis0,
     _sample_axis0,
@@ -22,6 +23,21 @@ from optimizer_utils import get_optimizer_iterations
 
 
 class Stage1RegressionTests(unittest.TestCase):
+    def test_tensorboard_axes_accept_anatomical_names(self):
+        self.assertEqual(as_axis_list(["AX", "COR", "SAG"]), ["z", "y", "x"])
+        self.assertEqual(as_axis_list(["z", "COR", "sagittal"]), ["z", "y", "x"])
+        self.assertEqual(
+            [axis_display_name(axis) for axis in ("z", "y", "x")],
+            ["AX", "COR", "SAG"],
+        )
+        self.assertEqual(axis_section_name("Test Prediction", "z"), "Test Prediction (AX)")
+        self.assertEqual(
+            axis_section_name("Test Prediction", "y"), "Test Prediction (COR)"
+        )
+        self.assertEqual(
+            axis_section_name("Test Prediction", "x"), "Test Prediction (SAG)"
+        )
+
     def test_resolve_target_path_accepts_full_config(self):
         cfg = OmegaConf.create(
             {"data": {"mode": "paired", "target_suffix": ".target"}}

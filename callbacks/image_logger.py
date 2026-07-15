@@ -4,6 +4,20 @@ import tensorflow as tf
 from optimizer_utils import get_optimizer_iterations
 
 
+AXIS_ALIASES = {
+    "z": "z",
+    "ax": "z",
+    "axial": "z",
+    "y": "y",
+    "cor": "y",
+    "coronal": "y",
+    "x": "x",
+    "sag": "x",
+    "sagittal": "x",
+}
+AXIS_DISPLAY_NAMES = {"z": "AX", "y": "COR", "x": "SAG"}
+
+
 def _take_slice(vol, axis: str):
     """
     (b, z, y, x, c) のボリュームから中央断面を取り出し (b, H, W, c) を返す。
@@ -20,14 +34,30 @@ def _take_slice(vol, axis: str):
 
 
 def as_axis_list(slice_axes) -> list[str]:
-    """log_axis設定を断面リストに正規化する（文字列1つでもリストでも受ける）"""
+    """log_axis設定をz/y/xへ正規化する（AX/COR/SAG表記も受ける）。"""
     if isinstance(slice_axes, str):
-        axes = [slice_axes]
+        requested_axes = [slice_axes]
     else:
-        axes = [str(a) for a in slice_axes]
-    for axis in axes:
-        assert axis in ("z", "y", "x"), f"log_axisはz/y/xで指定してください: {axis}"
+        requested_axes = [str(a) for a in slice_axes]
+
+    axes = []
+    for requested_axis in requested_axes:
+        key = str(requested_axis).lower()
+        assert key in AXIS_ALIASES, (
+            f"log_axisはz/y/xまたはAX/COR/SAGで指定してください: {requested_axis}"
+        )
+        axis = AXIS_ALIASES[key]
+        if axis not in axes:
+            axes.append(axis)
     return axes
+
+
+def axis_display_name(axis: str) -> str:
+    return AXIS_DISPLAY_NAMES[axis]
+
+
+def axis_section_name(prefix: str, axis: str) -> str:
+    return f"{prefix} ({axis_display_name(axis)})"
 
 
 class ImageLogger(keras.callbacks.Callback):
@@ -62,16 +92,22 @@ class ImageLogger(keras.callbacks.Callback):
                 if self.first_log:
                     # sourceとtargetは学習中変わらないので初回のみ記録する
                     tf.summary.image(
-                        f"Source Images/{axis}", _take_slice(src_imgs, axis), step=step
+                        axis_section_name("Source Images", axis),
+                        _take_slice(src_imgs, axis),
+                        step=step,
                     )
                     tf.summary.image(
-                        f"Target Images/{axis}", _take_slice(tgt_imgs, axis), step=step
+                        axis_section_name("Target Images", axis),
+                        _take_slice(tgt_imgs, axis),
+                        step=step,
                     )
                 tf.summary.image(
-                    f"Predicted Images/{axis}", _take_slice(preds, axis), step=step
+                    axis_section_name("Predicted Images", axis),
+                    _take_slice(preds, axis),
+                    step=step,
                 )
                 tf.summary.image(
-                    f"Absolute Error/{axis}",
+                    axis_section_name("Absolute Error", axis),
                     _take_slice(tf.abs(preds - tgt_imgs), axis),
                     step=step,
                 )

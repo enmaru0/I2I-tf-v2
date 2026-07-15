@@ -3,7 +3,7 @@ import tensorflow as tf
 
 from optimizer_utils import get_optimizer_iterations
 
-from .image_logger import _take_slice, as_axis_list
+from .image_logger import _take_slice, as_axis_list, axis_section_name
 
 
 class TestImageLogger(keras.callbacks.Callback):
@@ -62,12 +62,12 @@ class TestImageLogger(keras.callbacks.Callback):
                 for axis in self.slice_axes:
                     if self.first_log:
                         tf.summary.image(
-                            f"Test Input/{name}/{axis}",
+                            f'{axis_section_name("Test Input", axis)}/{name}',
                             _take_slice(self.src_disp[i : i + 1], axis),
                             step=step,
                         )
                     tf.summary.image(
-                        f"Test Prediction/{name}/{axis}",
+                        f'{axis_section_name("Test Prediction", axis)}/{name}',
                         _take_slice(preds[i : i + 1], axis),
                         step=step,
                     )

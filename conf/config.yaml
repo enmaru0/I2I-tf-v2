@@ -279,9 +279,9 @@ aug:
 
 image:
   modality: CT # CT or MR　画像の正規化方法を変えます
-  # TensorBoardの画像ロギング断面。z/y/xを複数指定できる（データはz,y,x順）
-  # 例: [y] / [z, y] / [z, y, x]。文字列1つ（log_axis: y）でも動く
-  log_axis: [y]
+  # TensorBoardの画像ロギング断面。z/y/xまたはAX/COR/SAGを複数指定できる
+  # （z=AX、y=COR、x=SAG。文字列1つでも動く）
+  log_axis: [AX, COR, SAG]
   # Trueの場合、targetの正規化にsourceと同じmin/maxを使う
   # デノイズ・ぼかし修正のような同一モダリティ変換ではTrueを推奨
   share_normalization: True
