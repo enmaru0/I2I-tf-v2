@@ -10,6 +10,8 @@ from omegaconf import OmegaConf
 
 from config_utils import load_config_with_extends
 from data.cac_motion import (
+    _centered_state_coefficients,
+    _make_centered_heart_states,
     _sample_zero_mean_calcium_shifts,
     _soft_calcium_components,
     calculate_cac_statistics,
@@ -96,6 +98,36 @@ def _small_config(simulator):
                 "calcium_mask_feather_mm": 0.0,
                 "calcium_mask_dilation_mm": 0.0,
                 "native_calcium_blur_sigma_mm_range": [0.4, 0.4],
+                "conserve_calcium_mass": True,
+                "crop_to_heart": False,
+                "simulation_crop_margin_mm_zyx": [3.0, 3.0, 3.0],
+                "crop_boundary_taper_mm": 1.0,
+            },
+            "centered_heart_fbp": {
+                "projection_backend": "scipy",
+                "projection_spacing_mm": 1.0,
+                "residual_interpolation_order": 1,
+                "num_views": 20,
+                "num_motion_states": 5,
+                "angular_range_deg": 180.0,
+                "mu_water_per_mm": 0.02,
+                "photon_count_range": [100000.0, 100000.0],
+                "add_poisson_noise": False,
+                "in_plane_displacement_mm_range": [1.0, 1.0],
+                "through_plane_displacement_mm_range": [0.0, 0.0],
+                "motion_direction_deg_range": [0.0, 0.0],
+                "rotation_deg_range": [0.5, 0.5],
+                "contraction_range": [0.005, 0.005],
+                "elastic_magnitude_mm_range": [0.5, 0.5],
+                "control_point_spacing_mm_zyx": [6.0, 6.0, 6.0],
+                "displacement_axis_scale_zyx": [0.0, 1.0, 1.0],
+                "calcium_extra_motion_mm_range": [0.3, 0.3],
+                "calcium_extra_direction_deg_range": [90.0, 90.0],
+                "calcium_mask_lower_hu": 100.0,
+                "calcium_mask_upper_hu": 200.0,
+                "calcium_mask_feather_mm": 0.0,
+                "calcium_mask_dilation_mm": 0.0,
+                "native_calcium_blur_sigma_mm_range": [0.2, 0.2],
                 "conserve_calcium_mass": True,
                 "crop_to_heart": False,
                 "simulation_crop_margin_mm_zyx": [3.0, 3.0, 3.0],
@@ -544,6 +576,58 @@ class CACMotionTests(unittest.TestCase):
             severity=1.0,
         )
         np.testing.assert_allclose(static_output, no_calcium, atol=1e-5)
+
+    def test_centered_coefficients_include_identity_and_zero_view_mean(self):
+        state_indices = np.repeat(np.arange(5, dtype=np.int32), 4)
+        coefficients, counts = _centered_state_coefficients(5, state_indices)
+        np.testing.assert_allclose(coefficients, [-1.0, -0.5, 0.0, 0.5, 1.0])
+        self.assertAlmostEqual(float(np.average(coefficients, weights=counts)), 0.0)
+        uneven = np.asarray([0, 0, 1, 2, 3, 4], np.int32)
+        coefficients, counts = _centered_state_coefficients(5, uneven)
+        self.assertEqual(float(coefficients[2]), 0.0)
+        self.assertAlmostEqual(float(np.average(coefficients, weights=counts)), 0.0)
+
+    def test_centered_states_keep_exact_gated_middle_state(self):
+        clean, heart_mask = _phantom()
+        cfg = _small_config("centered_heart_fbp").centered_heart_fbp
+        state_indices = np.repeat(np.arange(5, dtype=np.int32), 4)
+        states, metadata = _make_centered_heart_states(
+            clean,
+            [3.0, 0.5, 0.5],
+            heart_mask.astype(np.float32),
+            cfg,
+            {"severity": 1.0},
+            state_indices,
+            np.random.default_rng(23),
+        )
+        np.testing.assert_allclose(states[2], clean, atol=1e-5)
+        self.assertAlmostEqual(metadata["centered_coefficient_view_weighted_mean"], 0.0)
+
+    def test_centered_heart_fbp_blurs_whole_heart_without_large_cac_shift(self):
+        clean, heart_mask = _phantom()
+        output, metadata = simulate_cac_motion(
+            clean,
+            [3.0, 0.5, 0.5],
+            _small_config("centered_heart_fbp"),
+            rng=np.random.default_rng(29),
+            heart_mask=heart_mask,
+            severity=1.0,
+        )
+        self.assertTrue(metadata["centered_whole_heart_motion"])
+        self.assertEqual(
+            metadata["projection_geometry"], "axial_parallel_beam_centered_heart"
+        )
+        self.assertAlmostEqual(
+            metadata["centered_coefficient_view_weighted_mean"], 0.0, places=6
+        )
+        soft_tissue = (clean == 40.0) & heart_mask
+        self.assertGreater(
+            float(np.mean(np.abs(output[soft_tissue] - clean[soft_tissue]))), 0.0
+        )
+        metrics = compare_cac_pair(
+            output, clean, [3.0, 0.5, 0.5], heart_mask=heart_mask
+        )
+        self.assertLess(metrics["centroid_distance_mm"], 0.5)
 
     def test_cac_statistics_are_roi_limited(self):
         clean, heart_mask = _phantom()

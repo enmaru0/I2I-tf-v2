@@ -24,6 +24,7 @@ data:
     # image_blend: 高速近似 / parallel_fbp: affine motion投影
     # elastic_parallel_fbp: 局所3D elastic motion + state-grouped投影（opt-in）
     # calcium_local_fbp: 背景静止 + CAC高吸収成分だけの局所motion（opt-in）
+    # centered_heart_fbp: gated輪郭を中心に心臓全体を対称motion（opt-in）
     simulator: parallel_fbp
     variants_per_case: 3
     severity_range: [0.15, 1.0]
@@ -113,6 +114,43 @@ data:
 
       # 1 mm投影gridで消えるsub-mm blurだけをnative XYでCAC成分へ追加する。
       native_calcium_blur_sigma_mm_range: [0.2, 0.6]
+      conserve_calcium_mass: true
+
+      crop_to_heart: true
+      simulation_crop_margin_mm_zyx: [12.0, 20.0, 20.0]
+      crop_boundary_taper_mm: 5.0
+
+    centered_heart_fbp:
+      # 心臓全体を-d～0～+dへ対称変形し、non-gated様blurの中央をgated輪郭へ置く。
+      projection_backend: scipy # scipy / astra
+      projection_spacing_mm: 1.0
+      residual_interpolation_order: 1
+      num_views: 180
+      # 奇数かつnum_viewsの約数にするとidentity stateと対称なview数を持てる。
+      num_motion_states: 9
+      angular_range_deg: 180.0
+      mu_water_per_mm: 0.02
+      photon_count_range: [60000.0, 150000.0]
+      add_poisson_noise: true
+
+      # 値は撮影window内でgated中央輪郭から片側への最大変位。
+      in_plane_displacement_mm_range: [0.4, 1.5]
+      through_plane_displacement_mm_range: [0.0, 0.3]
+      motion_direction_deg_range: [0.0, 360.0]
+      rotation_deg_range: [0.0, 1.0]
+      contraction_range: [0.0, 0.01]
+      elastic_magnitude_mm_range: [0.2, 1.0]
+      control_point_spacing_mm_zyx: [12.0, 12.0, 12.0]
+      displacement_axis_scale_zyx: [0.15, 1.0, 1.0]
+
+      # whole-heart motionへCAC固有の小さな追加motionとnative PSFを重ねる。
+      calcium_extra_motion_mm_range: [0.0, 0.8]
+      calcium_extra_direction_deg_range: [0.0, 360.0]
+      calcium_mask_lower_hu: 100.0
+      calcium_mask_upper_hu: 200.0
+      calcium_mask_feather_mm: 0.5
+      calcium_mask_dilation_mm: 0.5
+      native_calcium_blur_sigma_mm_range: [0.1, 0.4]
       conserve_calcium_mass: true
 
       crop_to_heart: true

@@ -75,6 +75,7 @@ def main():
             "parallel_fbp",
             "elastic_parallel_fbp",
             "calcium_local_fbp",
+            "centered_heart_fbp",
         ],
         default=None,
     )

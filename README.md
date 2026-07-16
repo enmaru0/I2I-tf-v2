@@ -76,6 +76,13 @@ python utils/generate_cac_motion_dataset.py \
     --output-dir /data/cac/simulated_calcium_local \
     --simulator calcium_local_fbp
 
+# gated輪郭を中央に保ち、心臓全体へ対称motion blurを与える版
+python utils/generate_cac_motion_dataset.py \
+    --config conf/config_cac.yaml \
+    --input-dir /data/cac/gated_clean \
+    --output-dir /data/cac/simulated_centered_heart \
+    --simulator centered_heart_fbp
+
 # 出力: simulated/source と simulated/target
 python main.py --config conf/config_cac.yaml --overrides \
     exp_dir=results/cac_synthetic_pretrain \
@@ -83,7 +90,7 @@ python main.py --config conf/config_cac.yaml --overrides \
     data.target_data_dir=/data/cac/simulated/target
 ```
 
-`data.cac_motion.simulator`は4種類ある。
+`data.cac_motion.simulator`は5種類ある。
 
 - `image_blend`: 複数の局所warp時相を平均する高速な画像領域近似。
 - `parallel_fbp`: viewごとに異なる時相をAX parallel-beam投影し、Poisson noiseと
@@ -107,6 +114,13 @@ python main.py --config conf/config_cac.yaml --overrides \
   native 0.5 mm上でCAC成分だけにPSFとして追加する。PSF前後の高吸収余剰成分の総和は
   `conserve_calcium_mass: true`で保存する。130 HU threshold後の体積やAgatston scoreが
   保存されるという意味ではないため、実ペア統計に合わせてmotion振幅とblur sigmaを校正する。
+- `centered_heart_fbp`: 心臓全体のaffine/elastic状態を`-d ... 0 ... +d`へ対称配置し、
+  各状態へ割り当てたview数でmotion係数の平均を0にする。non-gated様に心臓輪郭全体を
+  ぼかしながら、motion-averaged contourの中央をgated targetへ残す対応重視のopt-in方式。
+  whole-heart motionへCAC固有の小さな追加motionとnative PSFを重ねられる。標準の
+  `num_views: 180`と`num_motion_states: 9`では各状態へ20 viewを均等に割り当て、中央に
+  identity stateを含む。大変形の位置補正を学習させるモードではないため、実ペア統計に
+  合わせて面内最大変位を主に0.4～1.5 mmの範囲で校正する。
 
 heart maskは画像と同じdirectoryのsidecar（`case.hdr`に対する
 `case.mask.hdr`）を自動で読み込む。別rootに置く場合は同じ相対directory構造で
