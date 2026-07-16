@@ -68,6 +68,12 @@ data:
   target_suffix: ".target"
   # paired_dirモード: targetのルートフォルダ（data_dir配下と同じ {split}/{dataset}/{同名} 構造）
   target_data_dir: ""
+  # paired_dirの対応付け。exactは同名、stem_tokenはfilename stemをdelimiterで分割したtokenで照合。
+  pair_matching:
+    method: exact
+    delimiter: "_"
+    token_index: 0
+    case_sensitive: true
   # MRI contrastをcleanへ先に適用し、その後にdenoise/SR劣化を生成する。
   # pairedではsource/targetへ同じ変換を共有するため位置対応を壊さない。
   contrast_augmentation:

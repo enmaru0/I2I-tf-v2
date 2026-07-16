@@ -12,6 +12,7 @@ from scipy.ndimage import gaussian_filter, uniform_filter1d, zoom
 from scipy.signal import fftconvolve
 from tqdm import tqdm
 
+from .pairing import resolve_target_hdr_path
 from .dataloader_utils import (
     load_intensity,
     load_organ_box,
@@ -28,22 +29,6 @@ from .utils import (
     random_crop_center_within_bb,
     virtual_thick_generator,
 )
-
-
-def resolve_target_hdr_path(src_hdr_path: Path, cfg) -> Path:
-    """
-    sourceのhdrパスから対応するtargetのhdrパスを返す。
-    - paired: 同一フォルダで xxx{target_suffix}.hdr
-    - paired_dir: target_data_dir配下の同名ファイル
-      （data_dirからの相対パス {split}/{dataset}/{filename} を維持する）
-    """
-    src_hdr_path = Path(src_hdr_path)
-    if cfg.data.mode == "paired_dir":
-        rel = src_hdr_path.relative_to(Path(cfg.data_dir))
-        return Path(cfg.data.target_data_dir) / rel
-    target_suffix = cfg.data.target_suffix
-    assert target_suffix.startswith("."), "target_suffix must start with ."
-    return src_hdr_path.with_suffix(target_suffix + ".hdr")
 
 
 def make_motion_blur_kernel(direction_zyx, length: float) -> np.ndarray:

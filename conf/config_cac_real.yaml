@@ -1,0 +1,13 @@
+# 位置合わせ済みCAC実ペア専用config。
+# filename stemを"_"で分割した先頭token（患者ID）が一致するsource/targetを対応付ける。
+# 1患者IDに複数のgated targetがある場合は曖昧なため、学習開始前にerrorとする。
+extends: config_cac.yaml
+
+exp_dir: results/cac_real
+
+data:
+  pair_matching:
+    method: stem_token
+    delimiter: "_"
+    token_index: 0
+    case_sensitive: true

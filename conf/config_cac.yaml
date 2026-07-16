@@ -1,8 +1,8 @@
 # CAC motion correction専用の差分config。
 # 既存conf/config.yamlは変更せず、このファイルだけを指定して利用する。
 #
-# 実ペア学習:
-# python main.py --config conf/config_cac.yaml --overrides \
+# 実ペア学習では、患者ID matchingを有効にしたconfig_cac_real.yamlを使う。
+# python main.py --config conf/config_cac_real.yaml --overrides \
 #   data_dir=/path/to/non_gated data.target_data_dir=/path/to/gated
 #
 # 合成ペアでpretrain後、実ペアを指定してfinetuneする運用を推奨する。

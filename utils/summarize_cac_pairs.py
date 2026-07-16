@@ -15,6 +15,7 @@ from data.cac_motion import (  # noqa: E402
     make_soft_heart_mask,
     resolve_heart_mask_path,
 )
+from data.pairing import resolve_target_hdr_path  # noqa: E402
 from irg import read_hdr, read_raw  # noqa: E402
 
 
@@ -56,6 +57,8 @@ def main():
     config = load_config_with_extends(args.config)
     source_root = args.source_dir.resolve()
     target_root = args.target_dir.resolve()
+    config.data_dir = source_root
+    config.data.target_data_dir = target_root
     headers = [
         path
         for path in sorted(source_root.glob("**/*.hdr"))
@@ -67,9 +70,7 @@ def main():
     cases = []
     for source_path in tqdm(headers, desc="summarizing CAC pairs"):
         relative = source_path.relative_to(source_root)
-        target_path = target_root / relative
-        if not target_path.exists():
-            raise FileNotFoundError(f"targetが見つかりません: {target_path}")
+        target_path = resolve_target_hdr_path(source_path, config)
         source_size, _, source_spacing = read_hdr(source_path)
         target_size, _, target_spacing = read_hdr(target_path)
         if tuple(source_size) != tuple(target_size) or not np.allclose(
@@ -109,6 +110,7 @@ def main():
             threshold=args.threshold_hu,
         )
         metrics["case"] = str(relative)
+        metrics["target_case"] = str(target_path.relative_to(target_root))
         cases.append(metrics)
 
     result = {"num_cases": len(cases), "summary": _summary(cases), "cases": cases}

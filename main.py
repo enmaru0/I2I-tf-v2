@@ -206,6 +206,15 @@ def read_cfg_and_parse_arg():
         assert Path(cfg.data.target_data_dir).exists(), (
             f"target_data_dirが存在しません: {cfg.data.target_data_dir}"
         )
+        pair_matching = cfg.data.get("pair_matching", {})
+        matching_method = str(pair_matching.get("method", "exact")).lower()
+        assert matching_method in ("exact", "stem_token"), (
+            "data.pair_matching.methodはexact/stem_tokenで指定してください"
+        )
+        if matching_method == "stem_token":
+            assert str(pair_matching.get("delimiter", "_")), (
+                "stem_token matchingではdelimiterを空にできません"
+            )
     if cfg.data.real_dc.enabled:
         assert cfg.data.mode == "self_sr", (
             "data.real_dcは現状self_srタスク向けです（劣化演算子がthrough-plane SR前提）"
@@ -278,7 +287,7 @@ def prepare_data_dict(cfg):
     """
     sourceのhdrパスのリストをデータセットごとに列挙する。
     - paired: source xxx.hdr, target xxx{target_suffix}.hdr（同一フォルダ、命名規則）
-    - paired_dir: source(data_dir)とtarget(target_data_dir)を別フォルダの同名ファイルで対応
+    - paired_dir: source/targetを別フォルダに置き、設定したfilename規則で対応
     - denoise / self_noise / self_sr: クリーン画像のみ（targetファイルは不要。劣化はローダ内で合成）
     targetやマスク類のrawファイルは除外する。
     """

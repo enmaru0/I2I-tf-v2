@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).parent.parent))
 from data.cac_motion import make_soft_heart_mask, resolve_heart_mask_path  # noqa: E402
+from data.pairing import resolve_target_hdr_path  # noqa: E402
 from config_utils import load_config_with_extends  # noqa: E402
 from irg import read_hdr, read_raw  # noqa: E402
 
@@ -35,6 +36,8 @@ def main():
     config = load_config_with_extends(args.config)
     source_root = args.source_dir.resolve()
     target_root = args.target_dir.resolve()
+    config.data_dir = source_root
+    config.data.target_data_dir = target_root
     source_headers = [
         path
         for path in sorted(source_root.glob("**/*.hdr"))
@@ -46,10 +49,7 @@ def main():
     for source_path in tqdm(source_headers, desc="preparing CAC boxes"):
         if ".mask." in source_path.name:
             continue
-        relative = source_path.relative_to(source_root)
-        target_path = target_root / relative
-        if not target_path.exists():
-            raise FileNotFoundError(f"targetが見つかりません: {target_path}")
+        target_path = resolve_target_hdr_path(source_path, config)
         size, _, spacing = read_hdr(target_path)
         target = read_raw(target_path).astype(np.float32)
         heart_mask = None

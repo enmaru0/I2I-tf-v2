@@ -13,6 +13,7 @@ from data.cac_motion import (
     resolve_heart_mask_path,
     simulate_cac_motion,
 )
+from data.pairing import extract_pair_key, resolve_target_hdr_path
 
 
 def _small_config(simulator):
@@ -62,6 +63,49 @@ def _phantom():
 
 
 class CACMotionTests(unittest.TestCase):
+    def test_real_cac_config_matches_first_underscore_token(self):
+        cfg = load_config_with_extends(Path("conf/config_cac_real.yaml"))
+        self.assertEqual(cfg.data.pair_matching.method, "stem_token")
+        self.assertEqual(extract_pair_key(Path("P001_non_gated.hdr"), cfg), "P001")
+
+    def test_patient_id_pair_matching_resolves_different_filenames(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            target_root = root / "target"
+            relative_parent = Path("train") / "cac"
+            source = source_root / relative_parent / "P001_non_gated.hdr"
+            target = target_root / relative_parent / "P001_gated_75pct.hdr"
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            source.touch()
+            target.touch()
+            cfg = load_config_with_extends(Path("conf/config_cac_real.yaml"))
+            cfg.data_dir = source_root
+            cfg.data.target_data_dir = target_root
+            self.assertEqual(resolve_target_hdr_path(source, cfg), target)
+
+    def test_patient_id_pair_matching_rejects_ambiguous_targets(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_root = root / "source"
+            target_root = root / "target"
+            source = source_root / "train" / "cac" / "P001_non_gated.hdr"
+            targets = [
+                target_root / "train" / "cac" / "P001_gated_a.hdr",
+                target_root / "train" / "cac" / "P001_gated_b.hdr",
+            ]
+            source.parent.mkdir(parents=True)
+            targets[0].parent.mkdir(parents=True)
+            source.touch()
+            for target in targets:
+                target.touch()
+            cfg = load_config_with_extends(Path("conf/config_cac_real.yaml"))
+            cfg.data_dir = source_root
+            cfg.data.target_data_dir = target_root
+            with self.assertRaisesRegex(ValueError, "targetが複数"):
+                resolve_target_hdr_path(source, cfg)
+
     def test_heart_mask_sidecar_is_found_next_to_image(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -134,6 +178,7 @@ class CACMotionTests(unittest.TestCase):
         self.assertEqual(cfg.data.mode, "paired_dir")
         self.assertEqual(list(cfg.aug.affine.norm_spacing_zyx), [3.0, 0.5, 0.5])
         self.assertEqual(cfg.algorithm.name, "cac_regression")
+        self.assertEqual(cfg.data.pair_matching.method, "exact")
         self.assertIn("edm_karras", cfg.algorithm)
         self.assertNotIn("extends", cfg)
 
