@@ -21,7 +21,12 @@ from data.dataloader import (
 )
 from data.utils import AffineTransform
 from losses import masked_psnr_per_sample, ssim_per_sample
-from inference_utils import resize_volume_to_shape, sliding_window_predict
+from inference_utils import (
+    fuse_native_xy_residual,
+    resize_volume_to_shape,
+    shape_for_spacing,
+    sliding_window_predict,
+)
 from trainers.base import BaseI2ITrainer
 from trainers.conditional_restoration_ode import conditional_restoration_sigma_schedule
 from trainers.edm import edm_sigma_schedule
@@ -29,6 +34,45 @@ from optimizer_utils import get_optimizer_iterations
 
 
 class Stage1RegressionTests(unittest.TestCase):
+    def test_shape_for_spacing_preserves_voxel_center_extent(self):
+        shape = shape_for_spacing((3, 8, 10), (4.0, 0.5, 0.4), (1.0, 0.5, 0.4))
+        np.testing.assert_array_equal(shape, [9, 8, 10])
+
+    def test_native_xy_zero_residual_preserves_native_in_plane_detail(self):
+        native = np.zeros((3, 8, 10), np.float32)
+        native[:, ::2, 1::2] = 100.0
+        model_source = resize_volume_to_shape(native, (9, 4, 4), order=1)
+        prediction01 = np.clip(model_source / 200.0, 0.0, 1.0)
+        output, spacing, residual = fuse_native_xy_residual(
+            native,
+            (4.0, 0.5, 0.4),
+            model_source,
+            prediction01,
+            0.0,
+            200.0,
+            target_z_spacing_mm=1.0,
+        )
+        expected = resize_volume_to_shape(native, (9, 8, 10), order=1)
+        np.testing.assert_allclose(output, expected, atol=1e-5)
+        np.testing.assert_array_equal(residual, 0.0)
+        np.testing.assert_allclose(spacing, [1.0, 0.5, 0.4])
+
+    def test_native_xy_residual_is_converted_back_to_intensity_units(self):
+        native = np.zeros((2, 6, 6), np.float32)
+        model_source = np.zeros((3, 3, 3), np.float32)
+        prediction01 = np.full(model_source.shape, 0.1, np.float32)
+        output, _, residual = fuse_native_xy_residual(
+            native,
+            (2.0, 0.5, 0.5),
+            model_source,
+            prediction01,
+            0.0,
+            200.0,
+            target_z_spacing_mm=1.0,
+        )
+        np.testing.assert_allclose(residual, 20.0, atol=1e-5)
+        np.testing.assert_allclose(output, 20.0, atol=1e-5)
+
     def test_concise_progbar_keeps_only_primary_metrics(self):
         logs = {
             "l1_loss": 1.0,

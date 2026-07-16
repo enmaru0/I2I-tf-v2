@@ -37,6 +37,15 @@ inference:
   patch_size_zyx: null
   overlap: 0.5
   batch_size: 1
+  # 1 mm modelの補正残差だけをnative XY gridへ戻すthrough-plane SR推論。
+  # 通常推論は変更せず、residual outputのmodelでのみopt-in利用する。
+  native_xy_residual:
+    enabled: false
+    # nullならaug.affine.norm_spacing_zyx[0]を出力z spacingに使う。
+    target_z_spacing_mm: null
+    base_interpolation_order: 1
+    residual_interpolation_order: 1
+    filename_suffix: ".native_xy_residual.pred"
 
 debug_time: False
 debug_train_val: False

@@ -153,6 +153,10 @@ python eval.py results/edm/checkpoints/model_best.keras --num_steps 1,2,4,8,16
 # 推論（元画像空間に戻してrawで保存。標準ではsliding-window推論）
 python predict.py results/reg/checkpoints/model_best.keras
 
+# Through-plane SR: 1 mm model残差だけをnative XYへ戻し、z=1 mmで保存
+python predict.py results/sr/checkpoints/model_best.keras \
+    --native-xy-residual --target-z-spacing-mm 1.0
+
 # 同一seed・optimizer・step予算で主要手法を比較（時間予算はbudget_mode=minutes）
 python compare_algorithms.py --exp_root results/compare \
     --algorithms regression i2i_rfr_x0 resshift \
@@ -170,6 +174,12 @@ generator（pix2pixではdiscriminatorも）を1回更新する。`num_train_ste
 MRIでは`data.contrast_augmentation.enabled=True`により、gamma/scale/shift/inversion/
 smooth bias fieldを劣化simulation前のcleanへ適用できる。pairedデータでは同じ変換を
 source/targetへ共有する。
+
+`predict.py --native-xy-residual`は`output_mode=residual`のmodel専用opt-in推論。
+入力全体を学習時`norm_spacing_zyx`へ変換してmodel残差を求める一方、別経路では
+native XYを保持してzだけを`target-z-spacing-mm`へ補間する。残差だけをnative gridへ
+戻して加算し、出力spacingを`[target_z, native_y, native_x]`として保存する。
+学習時の`image.share_normalization=True`が必要で、標準推論の挙動は変更しない。
 
 ## EMA（指数移動平均）
 

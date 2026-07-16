@@ -7,10 +7,7 @@ from scipy.ndimage import gaussian_filter, zoom
 
 
 def resize_volume_to_shape(
-    volume: np.ndarray,
-    out_shape_zyx,
-    order: int,
-    anti_alias: bool = True,
+    volume: np.ndarray, out_shape_zyx, order: int, anti_alias: bool = True
 ) -> np.ndarray:
     """3D volumeを指定shapeへリサンプルし、端数をcrop/padで厳密に合わせる。"""
     volume = np.asarray(volume, np.float32)
@@ -22,21 +19,116 @@ def resize_volume_to_shape(
         volume = gaussian_filter(volume, sigma=sigma, mode="nearest")
 
     output = zoom(
-        volume,
-        tuple(scale),
-        order=int(order),
-        prefilter=int(order) > 1,
-        mode="nearest",
+        volume, tuple(scale), order=int(order), prefilter=int(order) > 1, mode="nearest"
     ).astype(np.float32, copy=False)
 
     slices = tuple(slice(0, min(output.shape[i], int(out_shape[i]))) for i in range(3))
     output = output[slices]
-    pad_width = [
-        (0, max(0, int(out_shape[i]) - output.shape[i])) for i in range(3)
-    ]
+    pad_width = [(0, max(0, int(out_shape[i]) - output.shape[i])) for i in range(3)]
     if any(after > 0 for _, after in pad_width):
         output = np.pad(output, pad_width, mode="edge")
     return output
+
+
+def shape_for_spacing(shape_zyx, source_spacing_zyx, target_spacing_zyx) -> np.ndarray:
+    """先頭・末尾voxel中心間の物理長を維持したresample後shapeを返す。"""
+    shape = np.asarray(shape_zyx, np.int64)
+    source_spacing = np.asarray(source_spacing_zyx, np.float64)
+    target_spacing = np.asarray(target_spacing_zyx, np.float64)
+    if shape.shape != (3,) or np.any(shape < 1):
+        raise ValueError(f"shape_zyxは正の3要素にしてください: {shape_zyx}")
+    if (
+        source_spacing.shape != (3,)
+        or target_spacing.shape != (3,)
+        or np.any(source_spacing <= 0.0)
+        or np.any(target_spacing <= 0.0)
+    ):
+        raise ValueError(
+            "source/target spacingは正の3要素にしてください: "
+            f"{source_spacing_zyx}, {target_spacing_zyx}"
+        )
+    return np.rint((shape - 1) * source_spacing / target_spacing).astype(np.int64) + 1
+
+
+def fuse_native_xy_residual(
+    native_volume: np.ndarray,
+    native_spacing_zyx,
+    model_source: np.ndarray,
+    model_prediction_01: np.ndarray,
+    intensity_min: float,
+    intensity_max: float,
+    target_z_spacing_mm: float,
+    base_interpolation_order: int = 1,
+    residual_interpolation_order: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """1 mm model残差だけをnative XY gridへ戻し、z補間済み入力へ加える。
+
+    ``model_source``は正規化前のmodel grid画像、``model_prediction_01``は
+    ``[0, 1]``のmodel出力。戻り値は(output, output_spacing, residual_native)。
+    """
+
+    def as_volume(value, name):
+        array = np.asarray(value, np.float32)
+        if array.ndim == 4 and array.shape[-1] == 1:
+            array = array[..., 0]
+        if array.ndim != 3:
+            raise ValueError(f"{name}は3D volumeにしてください: {array.shape}")
+        return array
+
+    native = as_volume(native_volume, "native_volume")
+    model_src = as_volume(model_source, "model_source")
+    prediction01 = as_volume(model_prediction_01, "model_prediction_01")
+    if model_src.shape != prediction01.shape:
+        raise ValueError(
+            "model source/prediction shape mismatch: "
+            f"{model_src.shape} vs {prediction01.shape}"
+        )
+    if not np.all(np.isfinite(native)) or not np.all(np.isfinite(prediction01)):
+        raise FloatingPointError(
+            "native inputまたはmodel predictionにNaN/Infがあります"
+        )
+
+    intensity_min = float(intensity_min)
+    intensity_max = float(intensity_max)
+    intensity_range = intensity_max - intensity_min
+    if not np.isfinite(intensity_range) or intensity_range <= 0.0:
+        raise ValueError(
+            f"invalid intensity range: min={intensity_min}, max={intensity_max}"
+        )
+    target_z_spacing_mm = float(target_z_spacing_mm)
+    if not np.isfinite(target_z_spacing_mm) or target_z_spacing_mm <= 0.0:
+        raise ValueError(
+            f"target_z_spacing_mmは正にしてください: {target_z_spacing_mm}"
+        )
+
+    native_spacing = np.asarray(native_spacing_zyx, np.float32)
+    if native_spacing.shape != (3,) or np.any(native_spacing <= 0.0):
+        raise ValueError(f"native spacingが不正です: {native_spacing_zyx}")
+    output_spacing = np.array(
+        [target_z_spacing_mm, native_spacing[1], native_spacing[2]], np.float32
+    )
+    output_shape = shape_for_spacing(native.shape, native_spacing, output_spacing)
+
+    # native経路はzだけが変化し、元の面内画素を一切縮小しない。
+    native_base = resize_volume_to_shape(
+        native, output_shape, order=int(base_interpolation_order), anti_alias=True
+    )
+    model_source01 = np.clip((model_src - intensity_min) / intensity_range, 0.0, 1.0)
+    residual_model = (prediction01 - model_source01) * intensity_range
+    residual_native = resize_volume_to_shape(
+        residual_model,
+        output_shape,
+        order=int(residual_interpolation_order),
+        anti_alias=True,
+    )
+    output = native_base + residual_native
+    if not np.all(np.isfinite(output)):
+        raise FloatingPointError("native XY residual fusionがNaN/Infを生成しました")
+    return (
+        output.astype(np.float32, copy=False),
+        output_spacing,
+        residual_native.astype(np.float32, copy=False),
+    )
 
 
 def _sliding_starts(size: int, patch: int, overlap: float) -> list[int]:
@@ -53,9 +145,7 @@ def _blend_window(patch_size_zyx) -> np.ndarray:
     window = np.ones(tuple(patch_size_zyx), np.float32)
     for axis, size in enumerate(patch_size_zyx):
         weights = (
-            np.hanning(size).astype(np.float32)
-            if size > 1
-            else np.ones(1, np.float32)
+            np.hanning(size).astype(np.float32) if size > 1 else np.ones(1, np.float32)
         )
         weights = np.maximum(weights, 1e-3)
         shape = [1, 1, 1]
@@ -65,12 +155,7 @@ def _blend_window(patch_size_zyx) -> np.ndarray:
 
 
 def sliding_window_predict(
-    model,
-    data,
-    patch_size_zyx,
-    overlap: float,
-    batch_size: int,
-    base_seed: int,
+    model, data, patch_size_zyx, overlap: float, batch_size: int, base_seed: int
 ):
     """3D volumeをoverlap付きパッチで推論し、Hann重みで結合する。"""
     patch_size = np.asarray(patch_size_zyx, np.int32)
@@ -91,9 +176,7 @@ def sliding_window_predict(
         (0, int(pad_after[2])),
         (0, 0),
     )
-    src = np.pad(
-        src, pad_width, mode="constant", constant_values=min_val
-    )
+    src = np.pad(src, pad_width, mode="constant", constant_values=min_val)
     msk = np.pad(msk, pad_width, mode="constant")
 
     starts = [
@@ -137,11 +220,6 @@ def sliding_window_predict(
             weight_sum[z : end[0], y : end[1], x : end[2]] += weight
 
     pred = np.divide(
-        pred_sum,
-        weight_sum,
-        out=np.zeros_like(pred_sum),
-        where=weight_sum > 0,
+        pred_sum, weight_sum, out=np.zeros_like(pred_sum), where=weight_sum > 0
     )
-    return pred[
-        : original_shape[0], : original_shape[1], : original_shape[2], 0
-    ]
+    return pred[: original_shape[0], : original_shape[1], : original_shape[2], 0]

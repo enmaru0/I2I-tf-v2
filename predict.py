@@ -6,12 +6,16 @@ import keras
 import numpy as np
 import tensorflow as tf
 from absl import logging
-from irg import save_raw
+from irg import read_raw, save_raw
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from data.dataloader_test import create_dataloader_test
-from inference_utils import resize_volume_to_shape, sliding_window_predict
+from inference_utils import (
+    fuse_native_xy_residual,
+    resize_volume_to_shape,
+    sliding_window_predict,
+)
 from main import gpu_setting, prepare_data_dict
 from trainers import BaseI2ITrainer, build_trainer
 
@@ -29,11 +33,57 @@ def rescale_pred_to_org(pred, out_size_zyx):
     return resize_volume_to_shape(pred, out_size_zyx, order=1, anti_alias=True)
 
 
+def _native_xy_residual_settings(cfg, force_enabled=False, target_z_override=None):
+    cfg_native = cfg.get("inference", {}).get("native_xy_residual", {})
+    enabled = bool(cfg_native.get("enabled", False)) or bool(force_enabled)
+    target_z = cfg_native.get("target_z_spacing_mm", None)
+    if target_z_override is not None:
+        target_z = target_z_override
+    if target_z is None:
+        target_z = float(cfg.aug.affine.norm_spacing_zyx[0])
+    return enabled, float(target_z), cfg_native
+
+
+def _validate_native_xy_residual_mode(cfg, target_z_spacing_mm):
+    algorithm_name = str(cfg.algorithm.name)
+    algorithm_cfg = cfg.algorithm.get(algorithm_name, {})
+    output_mode = str(algorithm_cfg.get("output_mode", ""))
+    if output_mode != "residual":
+        raise ValueError(
+            "native XY residual推論はoutput_mode=residualのmodel専用です: "
+            f"algorithm={algorithm_name}, output_mode={output_mode or '(なし)'}"
+        )
+    if not bool(cfg.image.share_normalization):
+        raise ValueError(
+            "native XY residual推論ではsource/targetの線形強度差を一致させるため"
+            "image.share_normalization=Trueが必要です"
+        )
+    if not np.isfinite(target_z_spacing_mm) or target_z_spacing_mm <= 0.0:
+        raise ValueError(
+            f"target_z_spacing_mmは正にしてください: {target_z_spacing_mm}"
+        )
+
+
+def _to_int16(volume):
+    return np.clip(np.rint(volume), -32768, 32767).astype(np.int16)
+
+
 if __name__ == "__main__":
     logging.set_verbosity(logging.INFO)
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint_path", type=Path)
     parser.add_argument("--gpu", default="0", type=str, help="gpu num (default 0)")
+    parser.add_argument(
+        "--native-xy-residual",
+        action="store_true",
+        help="1 mm残差だけをnative XYへ加えるthrough-plane SR推論を有効化",
+    )
+    parser.add_argument(
+        "--target-z-spacing-mm",
+        type=float,
+        default=None,
+        help="native XY residual出力のz spacing。省略時は学習時norm spacing z",
+    )
     args = parser.parse_args()
 
     checkpoint_path: Path = args.checkpoint_path
@@ -60,6 +110,19 @@ if __name__ == "__main__":
     logging.info(f"Loaded from: {checkpoint_path} (step: {step})")
 
     cfg_infer = cfg.get("inference", {})
+    native_xy_enabled, target_z_spacing_mm, cfg_native_xy = (
+        _native_xy_residual_settings(
+            cfg,
+            force_enabled=args.native_xy_residual,
+            target_z_override=args.target_z_spacing_mm,
+        )
+    )
+    if native_xy_enabled:
+        _validate_native_xy_residual_mode(cfg, target_z_spacing_mm)
+        logging.info(
+            "Native XY residual inference enabled: target_z_spacing_mm=%.4f",
+            target_z_spacing_mm,
+        )
     use_sliding_window = bool(cfg_infer.get("sliding_window", True))
     configured_patch = cfg_infer.get("patch_size_zyx", None)
     patch_size_zyx = (
@@ -104,19 +167,43 @@ if __name__ == "__main__":
         tgt_min_val = data["tgt_min_clip_val"].numpy()
         tgt_max_val = data["tgt_max_clip_val"].numpy()
 
-        # [0,1] -> targetの強度レンジに戻す
-        pred = pred * (tgt_max_val - tgt_min_val) + tgt_min_val
+        if native_xy_enabled:
+            native_path = Path(data["img_path"].numpy().decode())
+            native_img = read_raw(native_path).astype(np.float32)
+            out, output_spacing, _ = fuse_native_xy_residual(
+                native_img,
+                spacing_zyx,
+                data["img"].numpy(),
+                pred,
+                float(data["src_min_clip_val"].numpy()),
+                float(data["src_max_clip_val"].numpy()),
+                target_z_spacing_mm,
+                base_interpolation_order=int(
+                    cfg_native_xy.get("base_interpolation_order", 1)
+                ),
+                residual_interpolation_order=int(
+                    cfg_native_xy.get("residual_interpolation_order", 1)
+                ),
+            )
+            suffix = str(
+                cfg_native_xy.get("filename_suffix", ".native_xy_residual.pred")
+            )
+            save_path = save_dir / f"{key}{suffix}.hdr"
+            save_raw(_to_int16(out), output_spacing, save_path)
+        else:
+            # [0,1] -> targetの強度レンジに戻す
+            pred = pred * (tgt_max_val - tgt_min_val) + tgt_min_val
 
-        # 結果を元画像空間に戻す
-        out_size_zyx = crop_zyxzyx[3:6] - crop_zyxzyx[:3]
-        pred = rescale_pred_to_org(pred, out_size_zyx)
+            # 結果を元画像空間に戻す
+            out_size_zyx = crop_zyxzyx[3:6] - crop_zyxzyx[:3]
+            pred = rescale_pred_to_org(pred, out_size_zyx)
 
-        out = np.full(list(img_size_zyx), tgt_min_val, np.float32)
-        out[
-            crop_zyxzyx[0] : crop_zyxzyx[3],
-            crop_zyxzyx[1] : crop_zyxzyx[4],
-            crop_zyxzyx[2] : crop_zyxzyx[5],
-        ] = pred
+            out = np.full(list(img_size_zyx), tgt_min_val, np.float32)
+            out[
+                crop_zyxzyx[0] : crop_zyxzyx[3],
+                crop_zyxzyx[1] : crop_zyxzyx[4],
+                crop_zyxzyx[2] : crop_zyxzyx[5],
+            ] = pred
 
-        save_path = save_dir / f"{key}.pred.hdr"
-        save_raw(out.astype(np.int16), spacing_zyx, save_path)
+            save_path = save_dir / f"{key}.pred.hdr"
+            save_raw(_to_int16(out), spacing_zyx, save_path)

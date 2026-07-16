@@ -44,10 +44,7 @@ def preprocess_image_np_test(img_hdr_list_with_data_name: list[bytes], cfg):
 
     img = read_raw(src_hdr_path, clip_zyxzyx=crop_zyxzyx)
     img = resize_volume_to_shape(
-        img,
-        resize_zyx,
-        order=int(cfg.aug.image_interpolation_order),
-        anti_alias=True,
+        img, resize_zyx, order=int(cfg.aug.image_interpolation_order), anti_alias=True
     )
 
     src_min_val, src_max_val = get_clip_vals(src_hdr_path, cfg)
@@ -71,6 +68,7 @@ def preprocess_image_np_test(img_hdr_list_with_data_name: list[bytes], cfg):
         np.array(tgt_min_val, np.float32),
         np.array(tgt_max_val, np.float32),
         str(src_hdr_path.stem).encode(),
+        str(src_hdr_path).encode(),
     )
 
 
@@ -91,6 +89,7 @@ def preprocess_image_test(img_hdr_path_with_data_name, cfg):
             tf.float32,  # tgt_min_val
             tf.float32,  # tgt_max_val
             tf.string,  # key
+            tf.string,  # source hdr path
         ],
     )
 
@@ -105,6 +104,7 @@ def make_dict_test(
     tgt_min_clip_val,
     tgt_max_clip_val,
     img_key,
+    img_path,
 ):
     data = dict(
         img=tf.cast(img, tf.float32),
@@ -118,6 +118,7 @@ def make_dict_test(
         tgt_min_clip_val=tgt_min_clip_val,
         tgt_max_clip_val=tgt_max_clip_val,
         img_key=img_key,
+        img_path=img_path,
     )
 
     return data
