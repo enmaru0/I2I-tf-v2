@@ -64,6 +64,10 @@ data:
     elastic_parallel_fbp:
       # scipyは追加依存なし。astraはASTRA Toolboxを明示導入した環境で利用する。
       projection_backend: scipy # scipy / astra
+      # 投影/FBPだけXYを1 mmへ縮小し、artifact残差をnative 0.5 mmへ戻して加える。
+      # nullならnative XYで投影する（従来挙動）。nativeより細かい値はnativeへ丸める。
+      projection_spacing_mm: 1.0
+      residual_interpolation_order: 1
       num_views: 180
       num_motion_states: 8
       angular_range_deg: 180.0

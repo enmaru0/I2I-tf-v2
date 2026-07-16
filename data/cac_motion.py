@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, label, map_coordinates, rotate
+from scipy.ndimage import gaussian_filter, label, map_coordinates, rotate, zoom
 
 
 HEART_MASK_SIDECAR_SUFFIXES = (".mask.hdr", ".heart.mask.hdr")
@@ -878,6 +878,81 @@ def _crop_boundary_taper(
     return taper
 
 
+def _resize_volume_to_shape(volume, output_shape_zyx, order, anti_alias=False):
+    """3D volumeを指定shapeへresizeし、丸め誤差を末端crop/padで吸収する。"""
+    array = np.asarray(volume, dtype=np.float32)
+    output_shape = np.asarray(output_shape_zyx, dtype=np.int32)
+    if array.ndim != 3 or output_shape.shape != (3,) or np.any(output_shape < 1):
+        raise ValueError(
+            f"3D volumeと正のoutput shapeが必要です: {array.shape}, {output_shape}"
+        )
+    scale = output_shape / np.asarray(array.shape, dtype=np.float64)
+    if anti_alias and np.any(scale < 1.0):
+        sigma = np.where(scale < 1.0, 0.5 * (1.0 / scale - 1.0), 0.0)
+        array = gaussian_filter(array, sigma=sigma, mode="nearest")
+    resized = zoom(
+        array, tuple(scale), order=int(order), mode="nearest", prefilter=int(order) > 1
+    ).astype(np.float32, copy=False)
+    resized = resized[
+        tuple(
+            slice(0, min(resized.shape[axis], int(output_shape[axis])))
+            for axis in range(3)
+        )
+    ]
+    padding = [
+        (0, max(0, int(output_shape[axis]) - resized.shape[axis])) for axis in range(3)
+    ]
+    if any(after > 0 for _, after in padding):
+        resized = np.pad(resized, padding, mode="edge")
+    return resized
+
+
+def _projection_grid(clean, mask, spacing_zyx, config):
+    """native zを保ち、投影用にXYだけを指定spacingへdownsampleする。"""
+    native_spacing = np.asarray(spacing_zyx, dtype=np.float32)
+    requested = _get(config, "projection_spacing_mm", None)
+    if requested is None:
+        projection_spacing = float(max(native_spacing[1], native_spacing[2]))
+    else:
+        requested = float(requested)
+        if not np.isfinite(requested) or requested <= 0.0:
+            raise ValueError(f"projection_spacing_mmは正またはnullです: {requested}")
+        # 投影用gridでnative画像をupsampleしても高速化・情報追加にならない。
+        projection_spacing = max(
+            requested, float(native_spacing[1]), float(native_spacing[2])
+        )
+    projection_spacing_zyx = np.array(
+        [native_spacing[0], projection_spacing, projection_spacing], np.float32
+    )
+    shape = np.asarray(clean.shape, dtype=np.int32)
+    output_shape = shape.copy()
+    for axis in (1, 2):
+        output_shape[axis] = max(
+            1,
+            int(
+                np.rint(
+                    (shape[axis] - 1)
+                    * native_spacing[axis]
+                    / projection_spacing_zyx[axis]
+                )
+            )
+            + 1,
+        )
+    if np.array_equal(output_shape, shape):
+        return (
+            np.asarray(clean, np.float32),
+            np.asarray(mask, np.float32),
+            native_spacing,
+        )
+    projection_clean = _resize_volume_to_shape(
+        clean, output_shape, order=1, anti_alias=True
+    )
+    projection_mask = np.clip(
+        _resize_volume_to_shape(mask, output_shape, order=1, anti_alias=False), 0.0, 1.0
+    )
+    return projection_clean, projection_mask, projection_spacing_zyx
+
+
 def simulate_elastic_parallel_fbp(clean_hu, spacing_zyx, mask, config, params, rng):
     """heart近傍を局所3D elastic変形し、state-grouped FBPを適用する。"""
     clean = np.asarray(clean_hu, dtype=np.float32)
@@ -887,9 +962,24 @@ def simulate_elastic_parallel_fbp(clean_hu, spacing_zyx, mask, config, params, r
     )
     cropped_clean = clean[crop]
     cropped_mask = weights[crop]
-    cropped_output, details = _simulate_elastic_parallel_fbp_core(
-        cropped_clean, spacing_zyx, cropped_mask, config, params, rng
+    cfg_fbp = _get(config, "elastic_parallel_fbp", {})
+    projection_clean, projection_mask, projection_spacing = _projection_grid(
+        cropped_clean, cropped_mask, spacing_zyx, cfg_fbp
     )
+    projection_output, details = _simulate_elastic_parallel_fbp_core(
+        projection_clean, projection_spacing, projection_mask, config, params, rng
+    )
+    projection_residual = projection_output - projection_clean
+    residual_order = int(_get(cfg_fbp, "residual_interpolation_order", 1))
+    if residual_order < 0 or residual_order > 5:
+        raise ValueError(
+            "elastic_parallel_fbp.residual_interpolation_orderは0～5です: "
+            f"{residual_order}"
+        )
+    native_residual = _resize_volume_to_shape(
+        projection_residual, cropped_clean.shape, order=residual_order, anti_alias=False
+    )
+    cropped_output = cropped_clean + native_residual
 
     crop_start = [int(item.start) for item in crop]
     crop_stop = [int(item.stop) for item in crop]
@@ -900,7 +990,6 @@ def simulate_elastic_parallel_fbp(clean_hu, spacing_zyx, mask, config, params, r
     if full_crop:
         output = cropped_output
     else:
-        cfg_fbp = _get(config, "elastic_parallel_fbp", {})
         taper = _crop_boundary_taper(
             cropped_clean.shape,
             spacing_zyx,
@@ -914,6 +1003,13 @@ def simulate_elastic_parallel_fbp(clean_hu, spacing_zyx, mask, config, params, r
         output[crop] = cropped_clean + taper * (cropped_output - cropped_clean)
     details["simulation_crop_zyxzyx"] = [*crop_start, *crop_stop]
     details["simulation_crop_fraction"] = float(cropped_clean.size / clean.size)
+    details["native_spacing_zyx"] = [float(value) for value in spacing_zyx]
+    details["projection_spacing_zyx"] = [float(value) for value in projection_spacing]
+    details["projection_shape_zyx"] = [int(value) for value in projection_clean.shape]
+    details["projection_grid_fraction"] = float(
+        projection_clean.size / cropped_clean.size
+    )
+    details["native_residual_fusion"] = True
     return output.astype(np.float32, copy=False), details
 
 

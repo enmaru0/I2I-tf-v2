@@ -17,6 +17,7 @@ from data.cac_motion import (
     motion_state,
     resolve_heart_mask_path,
     simulate_cac_motion,
+    simulate_elastic_parallel_fbp,
     warp_cardiac_state,
 )
 from data.pairing import extract_pair_key, resolve_target_hdr_path
@@ -57,6 +58,8 @@ def _small_config(simulator):
             },
             "elastic_parallel_fbp": {
                 "projection_backend": "scipy",
+                "projection_spacing_mm": 1.0,
+                "residual_interpolation_order": 1,
                 "num_views": 16,
                 "num_motion_states": 2,
                 "angular_range_deg": 180.0,
@@ -399,6 +402,35 @@ class CACMotionTests(unittest.TestCase):
         self.assertEqual(metadata["projection_backend"], "scipy")
         self.assertEqual(metadata["projection_geometry"], "axial_parallel_beam_elastic")
         self.assertGreater(metadata["elastic_max_displacement_mm"], 0.0)
+
+    def test_projection_grid_resizes_only_residual_back_to_native_xy(self):
+        _, yy, xx = np.indices((2, 8, 10))
+        clean = ((yy + xx) % 2).astype(np.float32) * 100.0
+        mask = np.ones(clean.shape, np.float32)
+        cfg = _small_config("elastic_parallel_fbp")
+        cfg.elastic_parallel_fbp.crop_to_heart = False
+        captured = {}
+
+        def fake_core(projection_clean, spacing, projection_mask, *args):
+            captured["shape"] = projection_clean.shape
+            captured["spacing"] = np.asarray(spacing)
+            self.assertEqual(projection_mask.shape, projection_clean.shape)
+            return projection_clean + 25.0, {"projection_backend": "scipy"}
+
+        with patch("data.cac_motion._simulate_elastic_parallel_fbp_core", fake_core):
+            output, metadata = simulate_elastic_parallel_fbp(
+                clean,
+                [3.0, 0.5, 0.5],
+                mask,
+                cfg,
+                {"severity": 0.5},
+                np.random.default_rng(1),
+            )
+        np.testing.assert_allclose(output, clean + 25.0, atol=1e-5)
+        self.assertEqual(captured["shape"], (2, 5, 5))
+        np.testing.assert_allclose(captured["spacing"], [3.0, 1.0, 1.0])
+        self.assertEqual(metadata["projection_shape_zyx"], [2, 5, 5])
+        self.assertTrue(metadata["native_residual_fusion"])
 
     def test_elastic_projection_crop_preserves_exterior(self):
         clean, _ = _phantom()

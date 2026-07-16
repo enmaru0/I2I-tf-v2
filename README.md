@@ -87,7 +87,10 @@ python main.py --config conf/config_cac.yaml --overrides \
   dynamic-static再構成差分、Poisson noiseを適用するopt-in方式。標準backendは`scipy`で、
   `projection_backend: astra`を選ぶ場合は`astra-toolbox`を実行環境へ別途導入する。
   標準ではheart mask周囲だけを投影してfull 512 matrixでの計算量を抑え、crop境界では
-  dynamic-static差分をtaperする。
+  dynamic-static差分をtaperする。さらに`projection_spacing_mm: 1.0`では投影とFBPだけを
+  1 mm XY gridで実行し、artifact残差だけをnative 0.5 mmへ戻してcleanへ加える。
+  `null`にすると従来のnative grid投影へ戻る。出力JSONには投影shape、spacing、grid縮小率を
+  `projection_shape_zyx`、`projection_spacing_zyx`、`projection_grid_fraction`として保存する。
   DGX Sparkのaarch64向けNGC 25.02 containerでは`astra-toolbox`のpip wheelがなく
   source buildも追加toolchainを要求するため、標準の`scipy` backendを推奨する。
 
