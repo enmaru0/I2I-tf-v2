@@ -1098,9 +1098,14 @@ def _simulate_calcium_local_fbp_core(clean_hu, spacing_zyx, mask, config, params
     }
 
 
-def _centered_state_coefficients(num_states, state_indices):
+def _centered_state_coefficients(num_states, state_indices, profile_gamma=1.0):
     """view加重平均0、最大絶対値1の対称motion係数を返す。"""
     coefficients = np.linspace(-1.0, 1.0, int(num_states), dtype=np.float64)
+    profile_gamma = float(profile_gamma)
+    if not np.isfinite(profile_gamma) or profile_gamma <= 0.0:
+        raise ValueError(f"motion_profile_gammaは正にしてください: {profile_gamma}")
+    # 1未満では中間stateを両端へ寄せ、最大変位を変えずにblur幅を増やす。
+    coefficients = np.sign(coefficients) * np.abs(coefficients) ** profile_gamma
     counts = np.bincount(
         np.asarray(state_indices, dtype=np.int32), minlength=int(num_states)
     ).astype(np.float64)
@@ -1128,7 +1133,10 @@ def _centered_state_indices(num_views, num_states):
 
 def _sample_centered_heart_parameters(config, params, rng):
     """撮影window内のcentered whole-heart motion振幅をsampleする。"""
-    severity = float(params["severity"])
+    severity_power = float(_get(config, "severity_power", 1.0))
+    if not np.isfinite(severity_power) or severity_power <= 0.0:
+        raise ValueError(f"severity_powerは正にしてください: {severity_power}")
+    severity = float(np.clip(params["severity"], 0.0, 1.0)) ** severity_power
     in_plane_mm = _sample_range(
         rng, _get(config, "in_plane_displacement_mm_range", [0.4, 1.5]), severity
     )
@@ -1165,6 +1173,8 @@ def _sample_centered_heart_parameters(config, params, rng):
         "calcium_extra_x_mm": extra_mm * math.cos(extra_direction),
         "calcium_extra_motion_mm": float(extra_mm),
         "calcium_extra_direction_deg": float(extra_direction_deg),
+        "effective_severity_scale": float(severity),
+        "severity_power": float(severity_power),
     }
 
 
@@ -1173,7 +1183,10 @@ def _make_centered_heart_states(
 ):
     """恒等輪郭を中心とする対称affine/elastic whole-heart状態を作る。"""
     num_states = int(np.max(state_indices)) + 1
-    coefficients, counts = _centered_state_coefficients(num_states, state_indices)
+    profile_gamma = float(_get(config, "motion_profile_gamma", 1.0))
+    coefficients, counts = _centered_state_coefficients(
+        num_states, state_indices, profile_gamma=profile_gamma
+    )
     sampled = _sample_centered_heart_parameters(config, params, rng)
     elastic_field = generate_smooth_elastic_field_mm(
         np.asarray(clean_hu).shape,
@@ -1236,7 +1249,10 @@ def _make_centered_heart_states(
     weighted_mean = float(np.average(coefficients, weights=counts))
     return states, {
         "centered_motion_coefficients": [float(value) for value in coefficients],
+        "centered_motion_profile_gamma": float(profile_gamma),
         "centered_coefficient_view_weighted_mean": weighted_mean,
+        "centered_effective_severity_scale": float(sampled["effective_severity_scale"]),
+        "centered_severity_power": float(sampled["severity_power"]),
         "centered_in_plane_displacement_mm": float(
             math.hypot(sampled["shift_y_mm"], sampled["shift_x_mm"])
         ),
@@ -1661,6 +1677,30 @@ def simulate_centered_heart_fbp(clean_hu, spacing_zyx, mask, config, params, rng
         projection_residual, cropped_clean.shape, order=residual_order, anti_alias=False
     )
 
+    # 1 mm投影で弱くなりやすいsub-mm whole-heart blurをnative XYで対称に補う。
+    effective_severity = float(
+        details.get("centered_effective_severity_scale", params["severity"])
+    )
+    native_heart_blur_sigma_mm = _sample_range(
+        rng,
+        _get(cfg_fbp, "native_heart_blur_sigma_mm_range", [0.15, 0.4]),
+        effective_severity,
+    )
+    cropped_output = cropped_clean + native_residual
+    if native_heart_blur_sigma_mm > 0.0:
+        spacing = np.asarray(spacing_zyx, dtype=np.float32)
+        blurred_output = gaussian_filter(
+            cropped_output,
+            sigma=(
+                0.0,
+                native_heart_blur_sigma_mm / spacing[1],
+                native_heart_blur_sigma_mm / spacing[2],
+            ),
+            mode="nearest",
+        )
+        heart_weight = np.clip(cropped_mask, 0.0, 1.0)
+        cropped_output += heart_weight * (blurred_output - cropped_output)
+
     # whole-heart motionに加え、CACの高吸収余剰だけへ弱いnative PSFを重ねる。
     _, native_calcium_excess, _ = _soft_calcium_components(
         cropped_clean, spacing_zyx, cropped_mask, cfg_fbp
@@ -1668,7 +1708,7 @@ def simulate_centered_heart_fbp(clean_hu, spacing_zyx, mask, config, params, rng
     native_blur_sigma_mm = _sample_range(
         rng,
         _get(cfg_fbp, "native_calcium_blur_sigma_mm_range", [0.1, 0.4]),
-        float(params["severity"]),
+        effective_severity,
     )
     native_blur_delta = np.zeros_like(cropped_clean)
     calcium_mass_scale = 1.0
@@ -1691,7 +1731,7 @@ def simulate_centered_heart_fbp(clean_hu, spacing_zyx, mask, config, params, rng
                 calcium_mass_scale = original_sum / blurred_sum
                 blurred_excess *= calcium_mass_scale
         native_blur_delta = blurred_excess - native_calcium_excess
-    cropped_output = cropped_clean + native_residual + native_blur_delta
+    cropped_output += native_blur_delta
 
     crop_start = [int(item.start) for item in crop]
     crop_stop = [int(item.stop) for item in crop]
@@ -1715,6 +1755,7 @@ def simulate_centered_heart_fbp(clean_hu, spacing_zyx, mask, config, params, rng
         output[crop] = cropped_clean + taper * (cropped_output - cropped_clean)
 
     details["native_calcium_blur_sigma_mm"] = float(native_blur_sigma_mm)
+    details["native_heart_blur_sigma_mm"] = float(native_heart_blur_sigma_mm)
     details["native_calcium_mass_scale"] = float(calcium_mass_scale)
     details["simulation_crop_zyxzyx"] = [*crop_start, *crop_stop]
     details["simulation_crop_fraction"] = float(cropped_clean.size / clean.size)

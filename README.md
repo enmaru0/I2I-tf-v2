@@ -120,7 +120,10 @@ python main.py --config conf/config_cac.yaml --overrides \
   whole-heart motionへCAC固有の小さな追加motionとnative PSFを重ねられる。標準の
   `num_views: 180`と`num_motion_states: 9`では各状態へ20 viewを均等に割り当て、中央に
   identity stateを含む。大変形の位置補正を学習させるモードではないため、実ペア統計に
-  合わせて面内最大変位を主に0.4～1.5 mmの範囲で校正する。
+  合わせて面内最大変位を主に0.8～2.5 mmの範囲で校正する。`severity_power: 0.5`は
+  低severity側のblur消失を抑え、`motion_profile_gamma: 0.65`は中間stateを両端へ寄せて
+  最大変位を増やさずblurを強める。1 mm投影で弱くなるsub-mm成分は
+  `native_heart_blur_sigma_mm_range`によりheart mask内だけへ対称PSFとして補う。
 
 heart maskは画像と同じdirectoryのsidecar（`case.hdr`に対する
 `case.mask.hdr`）を自動で読み込む。別rootに置く場合は同じ相対directory構造で

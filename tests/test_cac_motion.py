@@ -58,6 +58,8 @@ def _small_config(simulator):
                 "mu_water_per_mm": 0.02,
                 "photon_count_range": [100000.0, 100000.0],
                 "add_poisson_noise": False,
+                "severity_power": 1.0,
+                "motion_profile_gamma": 1.0,
                 "in_plane_blur_sigma_mm_range": [0.0, 0.0],
             },
             "elastic_parallel_fbp": {
@@ -127,6 +129,7 @@ def _small_config(simulator):
                 "calcium_mask_upper_hu": 200.0,
                 "calcium_mask_feather_mm": 0.0,
                 "calcium_mask_dilation_mm": 0.0,
+                "native_heart_blur_sigma_mm_range": [0.0, 0.0],
                 "native_calcium_blur_sigma_mm_range": [0.2, 0.2],
                 "conserve_calcium_mass": True,
                 "crop_to_heart": False,
@@ -582,10 +585,13 @@ class CACMotionTests(unittest.TestCase):
         coefficients, counts = _centered_state_coefficients(5, state_indices)
         np.testing.assert_allclose(coefficients, [-1.0, -0.5, 0.0, 0.5, 1.0])
         self.assertAlmostEqual(float(np.average(coefficients, weights=counts)), 0.0)
+        baseline = coefficients.copy()
         uneven = np.asarray([0, 0, 1, 2, 3, 4], np.int32)
         coefficients, counts = _centered_state_coefficients(5, uneven)
         self.assertEqual(float(coefficients[2]), 0.0)
         self.assertAlmostEqual(float(np.average(coefficients, weights=counts)), 0.0)
+        stronger, _ = _centered_state_coefficients(5, state_indices, profile_gamma=0.5)
+        self.assertGreater(abs(float(stronger[1])), abs(float(baseline[1])))
 
     def test_centered_states_keep_exact_gated_middle_state(self):
         clean, heart_mask = _phantom()

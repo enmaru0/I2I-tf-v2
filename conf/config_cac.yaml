@@ -133,24 +133,31 @@ data:
       photon_count_range: [60000.0, 150000.0]
       add_poisson_noise: true
 
+      # 低severityでもblurが消えすぎないようsqrt相当で振幅をscaleする。
+      severity_power: 0.5
+      # 1未満では中間stateを両端へ寄せ、中央位置を保ったままblur幅を増やす。
+      motion_profile_gamma: 0.65
+
       # 値は撮影window内でgated中央輪郭から片側への最大変位。
-      in_plane_displacement_mm_range: [0.4, 1.5]
+      in_plane_displacement_mm_range: [0.8, 2.5]
       through_plane_displacement_mm_range: [0.0, 0.3]
       motion_direction_deg_range: [0.0, 360.0]
-      rotation_deg_range: [0.0, 1.0]
-      contraction_range: [0.0, 0.01]
-      elastic_magnitude_mm_range: [0.2, 1.0]
+      rotation_deg_range: [0.0, 1.5]
+      contraction_range: [0.0, 0.015]
+      elastic_magnitude_mm_range: [0.4, 1.5]
       control_point_spacing_mm_zyx: [12.0, 12.0, 12.0]
       displacement_axis_scale_zyx: [0.15, 1.0, 1.0]
 
       # whole-heart motionへCAC固有の小さな追加motionとnative PSFを重ねる。
-      calcium_extra_motion_mm_range: [0.0, 0.8]
+      calcium_extra_motion_mm_range: [0.2, 1.2]
       calcium_extra_direction_deg_range: [0.0, 360.0]
       calcium_mask_lower_hu: 100.0
       calcium_mask_upper_hu: 200.0
       calcium_mask_feather_mm: 0.5
       calcium_mask_dilation_mm: 0.5
-      native_calcium_blur_sigma_mm_range: [0.1, 0.4]
+      # centeredなwhole-heart PSFで1 mm投影時のsub-mm blurを補う。
+      native_heart_blur_sigma_mm_range: [0.15, 0.45]
+      native_calcium_blur_sigma_mm_range: [0.2, 0.65]
       conserve_calcium_mass: true
 
       crop_to_heart: true
