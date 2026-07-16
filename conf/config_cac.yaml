@@ -23,6 +23,7 @@ data:
   cac_motion:
     # image_blend: 高速近似 / parallel_fbp: affine motion投影
     # elastic_parallel_fbp: 局所3D elastic motion + state-grouped投影（opt-in）
+    # calcium_local_fbp: 背景静止 + CAC高吸収成分だけの局所motion（opt-in）
     simulator: parallel_fbp
     variants_per_case: 3
     severity_range: [0.15, 1.0]
@@ -84,6 +85,39 @@ data:
       control_point_spacing_mm_zyx: [12.0, 12.0, 12.0]
       # AX 3 mmでは不確かなthrough-plane変形を抑え、面内elastic motionを主にする。
       displacement_axis_scale_zyx: [0.35, 1.0, 1.0]
+
+    calcium_local_fbp:
+      # 解剖学的背景は静止させ、CACの高吸収余剰成分だけをview間で移動する。
+      projection_backend: scipy # scipy / astra
+      projection_spacing_mm: 1.0
+      residual_interpolation_order: 1
+      num_views: 180
+      num_motion_states: 8
+      angular_range_deg: 180.0
+      mu_water_per_mm: 0.02
+      photon_count_range: [60000.0, 150000.0]
+      add_poisson_noise: true
+
+      # 値は撮影window内の最大変位。view数で重み付けした平均変位を0にする。
+      calcium_motion_amplitude_mm_range: [0.5, 1.5]
+      through_plane_amplitude_mm_range: [0.0, 0.3]
+      motion_direction_deg_range: [0.0, 360.0]
+      second_harmonic_range: [-0.1, 0.1]
+      zero_mean_trajectory: true
+
+      # 100～200 HUをsmoothstepでsoft CAC maskへ変換する。
+      calcium_mask_lower_hu: 100.0
+      calcium_mask_upper_hu: 200.0
+      calcium_mask_feather_mm: 0.5
+      calcium_mask_dilation_mm: 0.5
+
+      # 1 mm投影gridで消えるsub-mm blurだけをnative XYでCAC成分へ追加する。
+      native_calcium_blur_sigma_mm_range: [0.2, 0.6]
+      conserve_calcium_mass: true
+
+      crop_to_heart: true
+      simulation_crop_margin_mm_zyx: [12.0, 20.0, 20.0]
+      crop_boundary_taper_mm: 5.0
 
 algorithm:
   name: cac_regression

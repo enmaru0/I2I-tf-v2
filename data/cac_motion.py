@@ -7,7 +7,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.ndimage import gaussian_filter, label, map_coordinates, rotate, zoom
+from scipy.ndimage import (
+    gaussian_filter,
+    label,
+    map_coordinates,
+    maximum_filter,
+    rotate,
+    zoom,
+)
 
 
 HEART_MASK_SIDECAR_SUFFIXES = (".mask.hdr", ".heart.mask.hdr")
@@ -832,6 +839,261 @@ def _simulate_elastic_parallel_fbp_core(
     }
 
 
+def _soft_calcium_components(clean_hu, spacing_zyx, heart_mask, config):
+    """CAC由来の高吸収余剰成分と、それを除いた静的背景を作る。"""
+    clean = np.asarray(clean_hu, dtype=np.float32)
+    spacing = np.asarray(spacing_zyx, dtype=np.float32)
+    roi = np.asarray(heart_mask, dtype=np.float32)
+    if clean.ndim != 3 or roi.shape != clean.shape:
+        raise ValueError("clean_huとheart_maskは同一shapeの3D volumeにしてください")
+    if spacing.shape != (3,) or np.any(spacing <= 0.0):
+        raise ValueError(f"spacing_zyxが不正です: {spacing_zyx}")
+
+    lower_hu = float(_get(config, "calcium_mask_lower_hu", 100.0))
+    upper_hu = float(_get(config, "calcium_mask_upper_hu", 200.0))
+    if not np.isfinite(lower_hu) or not np.isfinite(upper_hu) or upper_hu <= lower_hu:
+        raise ValueError(
+            "calcium mask HUはupper > lowerにしてください: "
+            f"lower={lower_hu}, upper={upper_hu}"
+        )
+
+    normalized = np.clip((clean - lower_hu) / (upper_hu - lower_hu), 0.0, 1.0)
+    # smoothstepにより130 HU近傍のpartial-volume voxelを硬く分断しない。
+    intensity_weight = normalized * normalized * (3.0 - 2.0 * normalized)
+    intensity_weight *= (roi >= 0.25).astype(np.float32)
+
+    dilation_mm = max(float(_get(config, "calcium_mask_dilation_mm", 0.5)), 0.0)
+    if dilation_mm > 0.0:
+        radius_yx = np.ceil(dilation_mm / spacing[1:]).astype(np.int32)
+        size = (1, int(2 * radius_yx[0] + 1), int(2 * radius_yx[1] + 1))
+        spatial_weight = maximum_filter(intensity_weight, size=size, mode="nearest")
+    else:
+        spatial_weight = intensity_weight
+
+    feather_mm = max(float(_get(config, "calcium_mask_feather_mm", 0.5)), 0.0)
+    if feather_mm > 0.0:
+        sigma = (0.0, feather_mm / spacing[1] / 2.355, feather_mm / spacing[2] / 2.355)
+        spatial_weight = gaussian_filter(spatial_weight, sigma=sigma, mode="nearest")
+    calcium_weight = np.maximum(intensity_weight, spatial_weight)
+    calcium_weight *= (roi >= 0.25).astype(np.float32)
+    calcium_weight = np.clip(calcium_weight, 0.0, 1.0).astype(np.float32)
+
+    # lower_huを局所背景の上限近似とし、高吸収の余剰だけを動かす。
+    calcium_excess = calcium_weight * np.maximum(clean - lower_hu, 0.0)
+    static_background = clean - calcium_excess
+    return (
+        static_background.astype(np.float32, copy=False),
+        calcium_excess.astype(np.float32, copy=False),
+        calcium_weight,
+    )
+
+
+def _translate_volume_mm(volume, spacing_zyx, shift_zyx_mm, chunk_depth=8):
+    """正のshiftで内容を正方向へ移動する線形補間translation。"""
+    source = np.asarray(volume, dtype=np.float32)
+    spacing = np.asarray(spacing_zyx, dtype=np.float32)
+    shift = np.asarray(shift_zyx_mm, dtype=np.float32) / spacing
+    if source.ndim != 3 or spacing.shape != (3,) or shift.shape != (3,):
+        raise ValueError("volumeは3D、spacing/shiftは3要素にしてください")
+
+    output = np.empty_like(source)
+    depth = max(1, int(chunk_depth))
+    for z0 in range(0, source.shape[0], depth):
+        z1 = min(z0 + depth, source.shape[0])
+        zz, yy, xx = np.meshgrid(
+            np.arange(z0, z1, dtype=np.float32),
+            np.arange(source.shape[1], dtype=np.float32),
+            np.arange(source.shape[2], dtype=np.float32),
+            indexing="ij",
+        )
+        coords = np.stack([zz - shift[0], yy - shift[1], xx - shift[2]], axis=0)
+        output[z0:z1] = map_coordinates(
+            source, coords, order=1, mode="constant", cval=0.0, prefilter=False
+        )
+    return output
+
+
+def _sample_zero_mean_calcium_shifts(phases, state_indices, config, params, rng):
+    """撮影viewで重み付けした平均が0になるCAC局所translationを返す。"""
+    phases = np.asarray(phases, dtype=np.float64)
+    counts = np.bincount(
+        np.asarray(state_indices, dtype=np.int32), minlength=len(phases)
+    ).astype(np.float64)
+    if not np.any(counts > 0.0):
+        counts[:] = 1.0
+
+    severity = float(params["severity"])
+    amplitude_mm = _sample_range(
+        rng, _get(config, "calcium_motion_amplitude_mm_range", [0.5, 1.5]), severity
+    )
+    z_amplitude_mm = _sample_range(
+        rng, _get(config, "through_plane_amplitude_mm_range", [0.0, 0.3]), severity
+    )
+    direction_deg = _sample_range(
+        rng, _get(config, "motion_direction_deg_range", [0.0, 360.0])
+    )
+    direction = math.radians(direction_deg)
+    harmonic = _sample_range(rng, _get(config, "second_harmonic_range", [-0.1, 0.1]))
+    harmonic_phase = float(rng.uniform(0.0, 2.0 * math.pi))
+
+    def trajectory(phase_offset):
+        values = np.asarray(
+            [
+                _trajectory_value(float(phase), harmonic, harmonic_phase, phase_offset)
+                for phase in phases
+            ],
+            dtype=np.float64,
+        )
+        if bool(_get(config, "zero_mean_trajectory", True)):
+            values -= np.average(values, weights=counts)
+        scale = float(np.max(np.abs(values)))
+        return values / scale if scale > 1e-8 else np.zeros_like(values)
+
+    in_plane_curve = trajectory(0.0)
+    through_plane_curve = trajectory(0.17)
+    shifts = np.stack(
+        [
+            z_amplitude_mm * through_plane_curve,
+            amplitude_mm * math.sin(direction) * in_plane_curve,
+            amplitude_mm * math.cos(direction) * in_plane_curve,
+        ],
+        axis=1,
+    ).astype(np.float32)
+    weighted_mean = np.average(shifts.astype(np.float64), axis=0, weights=counts)
+    return shifts, {
+        "calcium_motion_amplitude_mm": float(amplitude_mm),
+        "calcium_through_plane_amplitude_mm": float(z_amplitude_mm),
+        "calcium_motion_direction_deg": float(direction_deg),
+        "calcium_second_harmonic": float(harmonic),
+        "calcium_shift_weighted_mean_zyx_mm": [float(value) for value in weighted_mean],
+        "calcium_state_shifts_zyx_mm": [
+            [float(value) for value in shift] for shift in shifts
+        ],
+    }
+
+
+def _simulate_calcium_local_fbp_core(clean_hu, spacing_zyx, mask, config, params, rng):
+    """背景を静止させ、CAC高吸収成分だけをview間で動かしてFBPする。"""
+    spacing = np.asarray(spacing_zyx, dtype=np.float32)
+    if not np.isclose(spacing[1], spacing[2], rtol=1e-3, atol=1e-4):
+        raise ValueError(
+            "calcium_local_fbpは等しいin-plane pixel spacingを前提とします"
+        )
+    cfg_fbp = _get(config, "calcium_local_fbp", {})
+    backend = str(_get(cfg_fbp, "projection_backend", "scipy")).lower()
+    if backend not in ("scipy", "astra"):
+        raise ValueError(
+            f"calcium_local_fbp.projection_backendはscipy/astraです: {backend}"
+        )
+    num_views = max(16, int(_get(cfg_fbp, "num_views", 180)))
+    num_states = max(2, int(_get(cfg_fbp, "num_motion_states", 8)))
+    angular_range = float(_get(cfg_fbp, "angular_range_deg", 180.0))
+    start_angle = math.radians(float(params["start_angle_deg"]))
+    angles = start_angle + np.linspace(
+        0.0, math.radians(angular_range), num_views, endpoint=False
+    )
+    phases = _sample_phases(num_states, config, params, rng, projection_config=cfg_fbp)
+    state_indices = np.minimum(
+        num_states - 1, np.arange(num_views) * num_states // num_views
+    )
+    shifts, motion_details = _sample_zero_mean_calcium_shifts(
+        phases, state_indices, cfg_fbp, params, rng
+    )
+    static_background, calcium_excess, calcium_weight = _soft_calcium_components(
+        clean_hu, spacing, mask, cfg_fbp
+    )
+    photon_count = _sample_range(
+        rng, _get(cfg_fbp, "photon_count_range", [60000.0, 150000.0])
+    )
+    # CACがなくnoiseも無効なら、FBPのfloat丸め誤差さえ背景へ加えない。
+    if not np.any(calcium_excess > 0.0) and not bool(
+        _get(cfg_fbp, "add_poisson_noise", True)
+    ):
+        return np.asarray(clean_hu, np.float32).copy(), {
+            "phases": [float(value) for value in phases],
+            "photon_count": float(photon_count),
+            "fbp_intensity_scale": 1.0,
+            "projection_backend": backend,
+            "projection_geometry": "axial_parallel_beam_calcium_local",
+            "num_motion_states": num_states,
+            "calcium_weight_voxels": 0,
+            "calcium_excess_sum_hu": 0.0,
+            **motion_details,
+        }
+    states = [
+        static_background + _translate_volume_mm(calcium_excess, spacing, shift)
+        for shift in shifts
+    ]
+
+    mu_water = float(_get(cfg_fbp, "mu_water_per_mm", 0.02))
+    if not np.isfinite(mu_water) or mu_water <= 0.0:
+        raise ValueError(f"mu_water_per_mmは正にしてください: {mu_water}")
+    padded_states = []
+    padding = None
+    for state in states:
+        attenuation = np.clip((state / 1000.0 + 1.0) * mu_water, 0.0, None)
+        padded, padding = _pad_axial_square(attenuation, cval=0.0)
+        padded_states.append(padded.astype(np.float32, copy=False))
+    dynamic_sinogram = _project_with_backend(
+        padded_states, angles, float(spacing[2]), state_indices, backend
+    )
+
+    clean_mu = np.clip((clean_hu / 1000.0 + 1.0) * mu_water, 0.0, None)
+    padded_clean, clean_padding = _pad_axial_square(clean_mu, cval=0.0)
+    if clean_padding != padding:
+        raise RuntimeError("dynamic/static projection padding mismatch")
+    static_sinogram = _project_with_backend(
+        [padded_clean.astype(np.float32, copy=False)],
+        angles,
+        float(spacing[2]),
+        np.zeros(num_views, dtype=np.int32),
+        backend,
+    )
+
+    if bool(_get(cfg_fbp, "add_poisson_noise", True)):
+        expected = photon_count * np.exp(-np.clip(dynamic_sinogram, 0.0, 20.0))
+        counts = rng.poisson(np.maximum(expected, 1e-3)).astype(np.float32)
+        dynamic_sinogram = -np.log(np.maximum(counts, 1.0) / photon_count)
+
+    if backend == "scipy":
+        dynamic_reconstruction = _crop_axial_padding(
+            _backproject_parallel(
+                _filter_sinogram(dynamic_sinogram, float(spacing[1])), angles
+            ),
+            padding,
+        )
+        static_reconstruction = _crop_axial_padding(
+            _backproject_parallel(
+                _filter_sinogram(static_sinogram, float(spacing[1])), angles
+            ),
+            padding,
+        )
+    else:
+        dynamic_reconstruction = _crop_axial_padding(
+            _reconstruct_with_backend(dynamic_sinogram, angles, backend), padding
+        )
+        static_reconstruction = _crop_axial_padding(
+            _reconstruct_with_backend(static_sinogram, angles, backend), padding
+        )
+
+    intensity_scale = _linear_intensity_scale(static_reconstruction, clean_hu, mu_water)
+    reconstructed_mu = clean_mu + intensity_scale * (
+        dynamic_reconstruction - static_reconstruction
+    )
+    output = (reconstructed_mu / mu_water - 1.0) * 1000.0
+    return output.astype(np.float32), {
+        "phases": [float(value) for value in phases],
+        "photon_count": float(photon_count),
+        "fbp_intensity_scale": float(intensity_scale),
+        "projection_backend": backend,
+        "projection_geometry": "axial_parallel_beam_calcium_local",
+        "num_motion_states": num_states,
+        "calcium_weight_voxels": int(np.count_nonzero(calcium_weight > 0.01)),
+        "calcium_excess_sum_hu": float(calcium_excess.sum(dtype=np.float64)),
+        **motion_details,
+    }
+
+
 def _heart_simulation_crop(mask, spacing_zyx, config):
     shape = np.asarray(mask.shape, dtype=np.int32)
     full = tuple(slice(0, int(size)) for size in shape)
@@ -1013,6 +1275,99 @@ def simulate_elastic_parallel_fbp(clean_hu, spacing_zyx, mask, config, params, r
     return output.astype(np.float32, copy=False), details
 
 
+def simulate_calcium_local_fbp(clean_hu, spacing_zyx, mask, config, params, rng):
+    """背景を固定し、CAC局所motion residualだけをnative画像へ加える。"""
+    clean = np.asarray(clean_hu, dtype=np.float32)
+    weights = np.asarray(mask, dtype=np.float32)
+    cfg_fbp = _get(config, "calcium_local_fbp", {})
+    crop = _heart_simulation_crop(weights, spacing_zyx, cfg_fbp)
+    cropped_clean = clean[crop]
+    cropped_mask = weights[crop]
+    projection_clean, projection_mask, projection_spacing = _projection_grid(
+        cropped_clean, cropped_mask, spacing_zyx, cfg_fbp
+    )
+    projection_output, details = _simulate_calcium_local_fbp_core(
+        projection_clean, projection_spacing, projection_mask, config, params, rng
+    )
+    projection_residual = projection_output - projection_clean
+    residual_order = int(_get(cfg_fbp, "residual_interpolation_order", 1))
+    if residual_order < 0 or residual_order > 5:
+        raise ValueError(
+            "calcium_local_fbp.residual_interpolation_orderは0～5です: "
+            f"{residual_order}"
+        )
+    native_residual = _resize_volume_to_shape(
+        projection_residual, cropped_clean.shape, order=residual_order, anti_alias=False
+    )
+
+    # 1 mm投影gridで失われやすいsub-mmのCAC blurだけをnative XYで補う。
+    _, native_calcium_excess, _ = _soft_calcium_components(
+        cropped_clean, spacing_zyx, cropped_mask, cfg_fbp
+    )
+    native_blur_sigma_mm = _sample_range(
+        rng,
+        _get(cfg_fbp, "native_calcium_blur_sigma_mm_range", [0.2, 0.6]),
+        float(params["severity"]),
+    )
+    native_blur_delta = np.zeros_like(cropped_clean)
+    calcium_mass_scale = 1.0
+    if native_blur_sigma_mm > 0.0 and np.any(native_calcium_excess > 0.0):
+        spacing = np.asarray(spacing_zyx, dtype=np.float32)
+        blurred_excess = gaussian_filter(
+            native_calcium_excess,
+            sigma=(
+                0.0,
+                native_blur_sigma_mm / spacing[1],
+                native_blur_sigma_mm / spacing[2],
+            ),
+            mode="constant",
+            cval=0.0,
+        )
+        if bool(_get(cfg_fbp, "conserve_calcium_mass", True)):
+            original_sum = float(native_calcium_excess.sum(dtype=np.float64))
+            blurred_sum = float(blurred_excess.sum(dtype=np.float64))
+            if original_sum > 0.0 and blurred_sum > 0.0:
+                calcium_mass_scale = original_sum / blurred_sum
+                blurred_excess *= calcium_mass_scale
+        native_blur_delta = blurred_excess - native_calcium_excess
+    cropped_output = cropped_clean + native_residual + native_blur_delta
+
+    crop_start = [int(item.start) for item in crop]
+    crop_stop = [int(item.stop) for item in crop]
+    full_crop = all(
+        crop_start[axis] == 0 and crop_stop[axis] == clean.shape[axis]
+        for axis in range(3)
+    )
+    if full_crop:
+        output = cropped_output
+    else:
+        taper = _crop_boundary_taper(
+            cropped_clean.shape,
+            spacing_zyx,
+            float(_get(cfg_fbp, "crop_boundary_taper_mm", 5.0)),
+            tapered_axes=tuple(
+                crop_start[axis] > 0 or crop_stop[axis] < clean.shape[axis]
+                for axis in range(3)
+            ),
+        )
+        output = clean.copy()
+        output[crop] = cropped_clean + taper * (cropped_output - cropped_clean)
+
+    details["native_calcium_blur_sigma_mm"] = float(native_blur_sigma_mm)
+    details["native_calcium_mass_scale"] = float(calcium_mass_scale)
+    details["simulation_crop_zyxzyx"] = [*crop_start, *crop_stop]
+    details["simulation_crop_fraction"] = float(cropped_clean.size / clean.size)
+    details["native_spacing_zyx"] = [float(value) for value in spacing_zyx]
+    details["projection_spacing_zyx"] = [float(value) for value in projection_spacing]
+    details["projection_shape_zyx"] = [int(value) for value in projection_clean.shape]
+    details["projection_grid_fraction"] = float(
+        projection_clean.size / cropped_clean.size
+    )
+    details["native_residual_fusion"] = True
+    details["calcium_selective_motion"] = True
+    return output.astype(np.float32, copy=False), details
+
+
 def calculate_cac_statistics(volume_hu, spacing_zyx, heart_mask=None, threshold=130.0):
     """Simulator校正用の簡易CAC統計を返す。診断用score実装ではない。"""
     volume = np.asarray(volume_hu, dtype=np.float32)
@@ -1141,10 +1496,14 @@ def simulate_cac_motion(
             output, details = simulate_elastic_parallel_fbp(
                 clean, spacing_zyx, mask, config, params, rng
             )
+        elif simulator == "calcium_local_fbp":
+            output, details = simulate_calcium_local_fbp(
+                clean, spacing_zyx, mask, config, params, rng
+            )
         else:
             raise ValueError(
                 "cac_motion.simulatorはimage_blend/parallel_fbp/"
-                "elastic_parallel_fbpで指定してください: "
+                "elastic_parallel_fbp/calcium_local_fbpで指定してください: "
                 f"{simulator}"
             )
         details["identity"] = False

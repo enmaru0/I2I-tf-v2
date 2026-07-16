@@ -10,6 +10,8 @@ from omegaconf import OmegaConf
 
 from config_utils import load_config_with_extends
 from data.cac_motion import (
+    _sample_zero_mean_calcium_shifts,
+    _soft_calcium_components,
     calculate_cac_statistics,
     compare_cac_pair,
     _project_parallel_views_astra,
@@ -73,6 +75,31 @@ def _small_config(simulator):
                 "crop_boundary_taper_mm": 1.0,
                 "control_point_spacing_mm_zyx": [6.0, 6.0, 6.0],
                 "displacement_axis_scale_zyx": [0.25, 1.0, 1.0],
+            },
+            "calcium_local_fbp": {
+                "projection_backend": "scipy",
+                "projection_spacing_mm": 1.0,
+                "residual_interpolation_order": 1,
+                "num_views": 16,
+                "num_motion_states": 4,
+                "angular_range_deg": 180.0,
+                "mu_water_per_mm": 0.02,
+                "photon_count_range": [100000.0, 100000.0],
+                "add_poisson_noise": False,
+                "calcium_motion_amplitude_mm_range": [1.0, 1.0],
+                "through_plane_amplitude_mm_range": [0.0, 0.0],
+                "motion_direction_deg_range": [0.0, 0.0],
+                "second_harmonic_range": [0.0, 0.0],
+                "zero_mean_trajectory": True,
+                "calcium_mask_lower_hu": 100.0,
+                "calcium_mask_upper_hu": 200.0,
+                "calcium_mask_feather_mm": 0.0,
+                "calcium_mask_dilation_mm": 0.0,
+                "native_calcium_blur_sigma_mm_range": [0.4, 0.4],
+                "conserve_calcium_mass": True,
+                "crop_to_heart": False,
+                "simulation_crop_margin_mm_zyx": [3.0, 3.0, 3.0],
+                "crop_boundary_taper_mm": 1.0,
             },
         }
     )
@@ -452,6 +479,71 @@ class CACMotionTests(unittest.TestCase):
         outside[z0:z1, y0:y1, x0:x1] = False
         np.testing.assert_array_equal(output[outside], clean[outside])
         self.assertLess(metadata["simulation_crop_fraction"], 1.0)
+
+    def test_soft_calcium_components_preserve_clean_sum(self):
+        clean, heart_mask = _phantom()
+        cfg = _small_config("calcium_local_fbp").calcium_local_fbp
+        background, excess, weight = _soft_calcium_components(
+            clean, [3.0, 0.5, 0.5], heart_mask, cfg
+        )
+        np.testing.assert_allclose(background + excess, clean, atol=1e-6)
+        self.assertEqual(float(excess[clean <= 100.0].max()), 0.0)
+        self.assertGreater(float(excess[clean == 600.0].mean()), 0.0)
+        self.assertGreater(float(weight[clean == 600.0].mean()), 0.99)
+
+    def test_calcium_shifts_are_view_weighted_zero_mean(self):
+        cfg = _small_config("calcium_local_fbp").calcium_local_fbp
+        phases = np.asarray([0.1, 0.2, 0.3, 0.4], np.float32)
+        state_indices = np.asarray([0, 0, 0, 1, 1, 2, 3], np.int32)
+        shifts, metadata = _sample_zero_mean_calcium_shifts(
+            phases, state_indices, cfg, {"severity": 1.0}, np.random.default_rng(3)
+        )
+        counts = np.bincount(state_indices, minlength=len(phases))
+        np.testing.assert_allclose(
+            np.average(shifts, axis=0, weights=counts), 0.0, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            metadata["calcium_shift_weighted_mean_zyx_mm"], 0.0, atol=1e-6
+        )
+        self.assertGreater(float(np.max(np.abs(shifts[:, 2]))), 0.9)
+
+    def test_calcium_local_fbp_changes_cac_without_global_deformation(self):
+        clean, heart_mask = _phantom()
+        cfg = _small_config("calcium_local_fbp")
+        output, metadata = simulate_cac_motion(
+            clean,
+            [3.0, 0.5, 0.5],
+            cfg,
+            rng=np.random.default_rng(17),
+            heart_mask=heart_mask,
+            severity=1.0,
+        )
+        self.assertTrue(metadata["calcium_selective_motion"])
+        self.assertEqual(
+            metadata["projection_geometry"], "axial_parallel_beam_calcium_local"
+        )
+        self.assertGreater(metadata["calcium_weight_voxels"], 0)
+        self.assertGreater(
+            float(np.mean(np.abs(output[clean >= 130.0] - clean[clean >= 130.0]))), 0.0
+        )
+        np.testing.assert_allclose(
+            metadata["calcium_shift_weighted_mean_zyx_mm"], 0.0, atol=1e-6
+        )
+        metrics = compare_cac_pair(
+            output, clean, [3.0, 0.5, 0.5], heart_mask=heart_mask
+        )
+        self.assertLess(metrics["centroid_distance_mm"], 0.5)
+
+        no_calcium = np.minimum(clean, 40.0)
+        static_output, _ = simulate_cac_motion(
+            no_calcium,
+            [3.0, 0.5, 0.5],
+            cfg,
+            rng=np.random.default_rng(17),
+            heart_mask=heart_mask,
+            severity=1.0,
+        )
+        np.testing.assert_allclose(static_output, no_calcium, atol=1e-5)
 
     def test_cac_statistics_are_roi_limited(self):
         clean, heart_mask = _phantom()

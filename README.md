@@ -69,6 +69,13 @@ python utils/generate_cac_motion_dataset.py \
     --output-dir /data/cac/simulated_elastic \
     --simulator elastic_parallel_fbp
 
+# 解剖学的背景を静止させ、CACだけに局所motion blurを与える版
+python utils/generate_cac_motion_dataset.py \
+    --config conf/config_cac.yaml \
+    --input-dir /data/cac/gated_clean \
+    --output-dir /data/cac/simulated_calcium_local \
+    --simulator calcium_local_fbp
+
 # 出力: simulated/source と simulated/target
 python main.py --config conf/config_cac.yaml --overrides \
     exp_dir=results/cac_synthetic_pretrain \
@@ -76,7 +83,7 @@ python main.py --config conf/config_cac.yaml --overrides \
     data.target_data_dir=/data/cac/simulated/target
 ```
 
-`data.cac_motion.simulator`は3種類ある。
+`data.cac_motion.simulator`は4種類ある。
 
 - `image_blend`: 複数の局所warp時相を平均する高速な画像領域近似。
 - `parallel_fbp`: viewごとに異なる時相をAX parallel-beam投影し、Poisson noiseと
@@ -93,6 +100,13 @@ python main.py --config conf/config_cac.yaml --overrides \
   `projection_shape_zyx`、`projection_spacing_zyx`、`projection_grid_fraction`として保存する。
   DGX Sparkのaarch64向けNGC 25.02 containerでは`astra-toolbox`のpip wheelがなく
   source buildも追加toolchainを要求するため、標準の`scipy` backendを推奨する。
+- `calcium_local_fbp`: gated CTを静的背景とCAC高吸収余剰成分へsoft分解し、CAC成分だけを
+  view間で局所移動してFBPするopt-in方式。view数で重み付けした平均変位を0にするため、
+  解剖学的背景とCAC重心の系統的な位置ずれを抑えながら、peak HU低下、辺縁の広がり、
+  angle依存artifactを合成できる。投影は標準で1 mm XY gridを使い、sub-mmのボケは
+  native 0.5 mm上でCAC成分だけにPSFとして追加する。PSF前後の高吸収余剰成分の総和は
+  `conserve_calcium_mass: true`で保存する。130 HU threshold後の体積やAgatston scoreが
+  保存されるという意味ではないため、実ペア統計に合わせてmotion振幅とblur sigmaを校正する。
 
 heart maskは画像と同じdirectoryのsidecar（`case.hdr`に対する
 `case.mask.hdr`）を自動で読み込む。別rootに置く場合は同じ相対directory構造で

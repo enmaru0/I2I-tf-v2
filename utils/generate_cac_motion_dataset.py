@@ -17,7 +17,7 @@ from data.cac_motion import (  # noqa: E402
     resolve_heart_mask_path,
     simulate_cac_motion,
 )
-from irg import read_hdr, read_raw, save_raw  # noqa: E402
+from irg import read_hdr, read_raw, save_raw, read_re4  # noqa: E402
 
 
 def _write_box(path: Path, mask: np.ndarray):
@@ -40,7 +40,7 @@ def _load_optional_mask(
     )
     if mask_path is None:
         return None
-    mask = read_raw(mask_path)
+    mask = read_re4(mask_path)
     if tuple(mask.shape) != tuple(shape):
         raise ValueError(
             f"heart mask shape mismatch: image={tuple(shape)}, mask={mask.shape}"
@@ -70,7 +70,12 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
         "--simulator",
-        choices=["image_blend", "parallel_fbp", "elastic_parallel_fbp"],
+        choices=[
+            "image_blend",
+            "parallel_fbp",
+            "elastic_parallel_fbp",
+            "calcium_local_fbp",
+        ],
         default=None,
     )
     args = parser.parse_args()
