@@ -62,6 +62,13 @@ python utils/generate_cac_motion_dataset.py \
     --output-dir /data/cac/simulated \
     --variants-per-case 3
 
+# 3D elastic motion版（追加依存なしのSciPy projectorを使用）
+python utils/generate_cac_motion_dataset.py \
+    --config conf/config_cac.yaml \
+    --input-dir /data/cac/gated_clean \
+    --output-dir /data/cac/simulated_elastic \
+    --simulator elastic_parallel_fbp
+
 # 出力: simulated/source と simulated/target
 python main.py --config conf/config_cac.yaml --overrides \
     exp_dir=results/cac_synthetic_pretrain \
@@ -69,12 +76,20 @@ python main.py --config conf/config_cac.yaml --overrides \
     data.target_data_dir=/data/cac/simulated/target
 ```
 
-`data.cac_motion.simulator`は2種類ある。
+`data.cac_motion.simulator`は3種類ある。
 
 - `image_blend`: 複数の局所warp時相を平均する高速な画像領域近似。
 - `parallel_fbp`: viewごとに異なる時相をAX parallel-beam投影し、Poisson noiseと
   FBP再構成を行う。angle依存streakを生成できるが、実scannerのcone/helical geometryを
   完全には再現しない。学習中ではなく事前生成に使う。
+- `elastic_parallel_fbp`: mm単位の滑らかな3D elastic fieldを同一症例・全時相で共有し、
+  soft heart mask内だけを変形する。motion stateごとにviewをまとめて投影し、HU→線減弱係数、
+  dynamic-static再構成差分、Poisson noiseを適用するopt-in方式。標準backendは`scipy`で、
+  `projection_backend: astra`を選ぶ場合は`astra-toolbox`を実行環境へ別途導入する。
+  標準ではheart mask周囲だけを投影してfull 512 matrixでの計算量を抑え、crop境界では
+  dynamic-static差分をtaperする。
+  DGX Sparkのaarch64向けNGC 25.02 containerでは`astra-toolbox`のpip wheelがなく
+  source buildも追加toolchainを要求するため、標準の`scipy` backendを推奨する。
 
 heart maskは画像と同じdirectoryのsidecar（`case.hdr`に対する
 `case.mask.hdr`）を自動で読み込む。別rootに置く場合は同じ相対directory構造で

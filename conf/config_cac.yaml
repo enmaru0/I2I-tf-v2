@@ -21,7 +21,8 @@ data:
   mode: paired_dir
   target_data_dir: ""
   cac_motion:
-    # image_blend: 高速な画像領域近似 / parallel_fbp: angle依存の投影・FBP近似
+    # image_blend: 高速近似 / parallel_fbp: affine motion投影
+    # elastic_parallel_fbp: 局所3D elastic motion + state-grouped投影（opt-in）
     simulator: parallel_fbp
     variants_per_case: 3
     severity_range: [0.15, 1.0]
@@ -37,6 +38,7 @@ data:
     through_plane_displacement_mm_range: [0.0, 3.0]
     rotation_deg_range: [0.0, 5.0]
     contraction_range: [0.0, 0.04]
+    elastic_magnitude_mm_range: [0.0, 3.0]
     second_harmonic_range: [-0.25, 0.25]
 
     # heart maskがない場合のsoft ellipsoid fallback。
@@ -58,6 +60,26 @@ data:
       photon_count_range: [30000.0, 120000.0]
       add_poisson_noise: true
       in_plane_blur_sigma_mm_range: [0.0, 0.4]
+
+    elastic_parallel_fbp:
+      # scipyは追加依存なし。astraはASTRA Toolboxを明示導入した環境で利用する。
+      projection_backend: scipy # scipy / astra
+      num_views: 180
+      num_motion_states: 8
+      angular_range_deg: 180.0
+      mu_water_per_mm: 0.02
+      photon_count_range: [30000.0, 120000.0]
+      add_poisson_noise: true
+      # 0で全viewを動的状態から生成。旧prototypeの50%静止混合は0.5で再現可能。
+      static_projection_fraction: 0.0
+      in_plane_blur_sigma_mm_range: [0.0, 0.4]
+      # full 512 matrixを投影せずheart周囲だけを処理し、境界でartifact差分をtaperする。
+      crop_to_heart: true
+      simulation_crop_margin_mm_zyx: [12.0, 20.0, 20.0]
+      crop_boundary_taper_mm: 5.0
+      control_point_spacing_mm_zyx: [12.0, 12.0, 12.0]
+      # AX 3 mmでは不確かなthrough-plane変形を抑え、面内elastic motionを主にする。
+      displacement_axis_scale_zyx: [0.35, 1.0, 1.0]
 
 algorithm:
   name: cac_regression

@@ -1,6 +1,9 @@
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 from omegaconf import OmegaConf
@@ -9,9 +12,12 @@ from config_utils import load_config_with_extends
 from data.cac_motion import (
     calculate_cac_statistics,
     compare_cac_pair,
+    _project_parallel_views_astra,
+    generate_smooth_elastic_field_mm,
     motion_state,
     resolve_heart_mask_path,
     simulate_cac_motion,
+    warp_cardiac_state,
 )
 from data.pairing import extract_pair_key, resolve_target_hdr_path
 
@@ -31,6 +37,7 @@ def _small_config(simulator):
             "through_plane_displacement_mm_range": [0.0, 0.0],
             "rotation_deg_range": [1.0, 1.0],
             "contraction_range": [0.01, 0.01],
+            "elastic_magnitude_mm_range": [2.0, 2.0],
             "second_harmonic_range": [0.0, 0.0],
             "mask_feather_mm": 1.0,
             "fallback_center_fraction_zyx": [0.5, 0.5, 0.5],
@@ -48,6 +55,22 @@ def _small_config(simulator):
                 "add_poisson_noise": False,
                 "in_plane_blur_sigma_mm_range": [0.0, 0.0],
             },
+            "elastic_parallel_fbp": {
+                "projection_backend": "scipy",
+                "num_views": 16,
+                "num_motion_states": 2,
+                "angular_range_deg": 180.0,
+                "mu_water_per_mm": 0.02,
+                "photon_count_range": [100000.0, 100000.0],
+                "add_poisson_noise": False,
+                "static_projection_fraction": 0.0,
+                "in_plane_blur_sigma_mm_range": [0.0, 0.0],
+                "crop_to_heart": False,
+                "simulation_crop_margin_mm_zyx": [3.0, 3.0, 3.0],
+                "crop_boundary_taper_mm": 1.0,
+                "control_point_spacing_mm_zyx": [6.0, 6.0, 6.0],
+                "displacement_axis_scale_zyx": [0.25, 1.0, 1.0],
+            },
         }
     )
 
@@ -63,6 +86,65 @@ def _phantom():
 
 
 class CACMotionTests(unittest.TestCase):
+    def test_astra_projection_groups_views_and_releases_objects(self):
+        class FakeAstra:
+            def __init__(self):
+                self.next_id = 1
+                self.projectors = {}
+                self.data_ids = set()
+                self.create_sino_calls = 0
+                self.projector = SimpleNamespace(delete=self.delete_projector)
+                self.data2d = SimpleNamespace(delete=self.delete_data)
+
+            @staticmethod
+            def create_vol_geom(height, width):
+                return height, width
+
+            @staticmethod
+            def create_proj_geom(kind, spacing, detector_count, angles):
+                return {
+                    "kind": kind,
+                    "spacing": spacing,
+                    "detector_count": detector_count,
+                    "angles": np.asarray(angles),
+                }
+
+            def create_projector(self, kind, projection_geometry, volume_geometry):
+                identifier = self.next_id
+                self.next_id += 1
+                self.projectors[identifier] = projection_geometry
+                return identifier
+
+            def create_sino(self, image, projector_id):
+                self.create_sino_calls += 1
+                identifier = self.next_id
+                self.next_id += 1
+                self.data_ids.add(identifier)
+                angles = self.projectors[projector_id]["angles"]
+                projection = np.repeat(image.sum(axis=1)[None], len(angles), axis=0)
+                return identifier, projection
+
+            def delete_projector(self, identifier):
+                self.projectors.pop(identifier)
+
+            def delete_data(self, identifier):
+                self.data_ids.remove(identifier)
+
+        fake_astra = FakeAstra()
+        states = [np.ones((1, 4, 4), np.float32), np.full((1, 4, 4), 2.0, np.float32)]
+        with patch.dict(sys.modules, {"astra": fake_astra}):
+            sinogram = _project_parallel_views_astra(
+                states,
+                np.linspace(0.0, np.pi, 4, endpoint=False),
+                0.5,
+                np.array([0, 0, 1, 1]),
+            )
+        np.testing.assert_allclose(sinogram[0, :, :2], 2.0)
+        np.testing.assert_allclose(sinogram[0, :, 2:], 4.0)
+        self.assertEqual(fake_astra.create_sino_calls, 2)
+        self.assertFalse(fake_astra.projectors)
+        self.assertFalse(fake_astra.data_ids)
+
     def test_real_cac_config_matches_first_underscore_token(self):
         cfg = load_config_with_extends(Path("conf/config_cac_real.yaml"))
         self.assertEqual(cfg.data.pair_matching.method, "stem_token")
@@ -234,6 +316,110 @@ class CACMotionTests(unittest.TestCase):
         self.assertEqual(
             metadata["projection_geometry"], "axial_parallel_beam_approximation"
         )
+
+    def test_elastic_field_is_seeded_and_uses_mm_amplitude(self):
+        clean, heart_mask = _phantom()
+        cfg = _small_config("elastic_parallel_fbp")
+        params = {"elastic_magnitude_mm": 2.0}
+        first = generate_smooth_elastic_field_mm(
+            clean.shape,
+            [3.0, 0.5, 0.5],
+            heart_mask.astype(np.float32),
+            cfg,
+            params,
+            np.random.default_rng(5),
+        )
+        second = generate_smooth_elastic_field_mm(
+            clean.shape,
+            [3.0, 0.5, 0.5],
+            heart_mask.astype(np.float32),
+            cfg,
+            params,
+            np.random.default_rng(5),
+        )
+        np.testing.assert_array_equal(first, second)
+        norm = np.sqrt(np.sum(first * first, axis=0))
+        self.assertAlmostEqual(
+            float(np.percentile(norm[heart_mask], 99.0)), 2.0, places=4
+        )
+
+    def test_elastic_warp_does_not_move_hard_mask_exterior(self):
+        clean, heart_mask = _phantom()
+        cfg = _small_config("elastic_parallel_fbp")
+        field = generate_smooth_elastic_field_mm(
+            clean.shape,
+            [3.0, 0.5, 0.5],
+            heart_mask.astype(np.float32),
+            cfg,
+            {"elastic_magnitude_mm": 2.0},
+            np.random.default_rng(3),
+        )
+        state = {
+            "shift_z_mm": 0.0,
+            "shift_y_mm": 0.0,
+            "shift_x_mm": 0.0,
+            "rotation_deg": 0.0,
+            "contraction": 0.0,
+            "elastic_scale": 1.0,
+        }
+        warped = warp_cardiac_state(
+            clean,
+            [3.0, 0.5, 0.5],
+            heart_mask.astype(np.float32),
+            state,
+            elastic_field_mm=field,
+        )
+        np.testing.assert_array_equal(warped[~heart_mask], clean[~heart_mask])
+        self.assertGreater(
+            float(np.mean(np.abs(warped[heart_mask] - clean[heart_mask]))), 0.0
+        )
+
+    def test_elastic_parallel_fbp_is_deterministic(self):
+        clean, heart_mask = _phantom()
+        cfg = _small_config("elastic_parallel_fbp")
+        first, metadata = simulate_cac_motion(
+            clean,
+            [3.0, 0.5, 0.5],
+            cfg,
+            rng=np.random.default_rng(17),
+            heart_mask=heart_mask,
+            severity=0.6,
+        )
+        second, _ = simulate_cac_motion(
+            clean,
+            [3.0, 0.5, 0.5],
+            cfg,
+            rng=np.random.default_rng(17),
+            heart_mask=heart_mask,
+            severity=0.6,
+        )
+        np.testing.assert_allclose(first, second)
+        self.assertEqual(first.shape, clean.shape)
+        self.assertTrue(np.all(np.isfinite(first)))
+        self.assertEqual(metadata["projection_backend"], "scipy")
+        self.assertEqual(metadata["projection_geometry"], "axial_parallel_beam_elastic")
+        self.assertGreater(metadata["elastic_max_displacement_mm"], 0.0)
+
+    def test_elastic_projection_crop_preserves_exterior(self):
+        clean, _ = _phantom()
+        _, yy, xx = np.indices(clean.shape)
+        heart_mask = (yy - 12) ** 2 + (xx - 12) ** 2 <= 4**2
+        cfg = _small_config("elastic_parallel_fbp")
+        cfg.elastic_parallel_fbp.crop_to_heart = True
+        cfg.elastic_parallel_fbp.simulation_crop_margin_mm_zyx = [0.0, 1.0, 1.0]
+        output, metadata = simulate_cac_motion(
+            clean,
+            [3.0, 0.5, 0.5],
+            cfg,
+            rng=np.random.default_rng(21),
+            heart_mask=heart_mask,
+            severity=0.6,
+        )
+        z0, y0, x0, z1, y1, x1 = metadata["simulation_crop_zyxzyx"]
+        outside = np.ones(clean.shape, bool)
+        outside[z0:z1, y0:y1, x0:x1] = False
+        np.testing.assert_array_equal(output[outside], clean[outside])
+        self.assertLess(metadata["simulation_crop_fraction"], 1.0)
 
     def test_cac_statistics_are_roi_limited(self):
         clean, heart_mask = _phantom()

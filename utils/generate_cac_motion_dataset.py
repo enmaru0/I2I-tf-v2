@@ -3,6 +3,7 @@
 import argparse
 import json
 import sys
+import time
 import zlib
 from pathlib import Path
 
@@ -68,7 +69,9 @@ def main():
     parser.add_argument("--variants-per-case", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
-        "--simulator", choices=["image_blend", "parallel_fbp"], default=None
+        "--simulator",
+        choices=["image_blend", "parallel_fbp", "elastic_parallel_fbp"],
+        default=None,
     )
     args = parser.parse_args()
 
@@ -92,7 +95,8 @@ def main():
     if not headers:
         raise FileNotFoundError(f"gated CAC volumeが見つかりません: {input_dir}")
 
-    for hdr_path in tqdm(headers, desc="generating CAC motion pairs"):
+    progress = tqdm(headers, desc="generating CAC motion pairs")
+    for hdr_path in progress:
         relative = hdr_path.relative_to(input_dir)
         size_zyx, _, spacing_zyx = read_hdr(hdr_path)
         clean = read_raw(hdr_path).astype(np.float32)
@@ -106,10 +110,16 @@ def main():
         crop_mask = cac_mask if np.any(cac_mask) else soft_heart >= 0.5
 
         for variant in range(variants):
+            progress.set_postfix_str(
+                f"{relative} variant={variant + 1}/{variants} "
+                f"simulator={cfg_cac.simulator}",
+                refresh=True,
+            )
             key = f"{relative.stem}__sim{variant:03d}"
             relative_variant = relative.with_name(key + ".hdr")
             seed_key = f"{relative}:{variant}".encode()
             sample_seed = (base_seed + zlib.crc32(seed_key)) & 0xFFFFFFFF
+            started_at = time.perf_counter()
             simulated, metadata = simulate_cac_motion(
                 clean,
                 spacing_zyx,
@@ -117,11 +127,13 @@ def main():
                 rng=np.random.default_rng(sample_seed),
                 heart_mask=heart_mask,
             )
+            simulation_seconds = time.perf_counter() - started_at
             metadata.update(
                 {
                     "seed": int(sample_seed),
                     "input": str(relative),
                     "spacing_zyx": [float(value) for value in spacing_zyx],
+                    "simulation_seconds": float(simulation_seconds),
                 }
             )
 
