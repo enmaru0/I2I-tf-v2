@@ -12,6 +12,7 @@ from config_utils import load_config_with_extends
 from data.cac_motion import (
     _centered_state_coefficients,
     _make_centered_heart_states,
+    _recenter_elastic_motion_states,
     _sample_zero_mean_calcium_shifts,
     _soft_calcium_components,
     calculate_cac_statistics,
@@ -438,6 +439,84 @@ class CACMotionTests(unittest.TestCase):
         self.assertGreater(
             float(np.mean(np.abs(warped[heart_mask] - clean[heart_mask]))), 0.0
         )
+
+    def test_elastic_motion_recenter_has_zero_view_weighted_mean_and_limit(self):
+        states = [
+            {
+                "shift_z_mm": 0.0,
+                "shift_y_mm": 0.0,
+                "shift_x_mm": shift,
+                "rotation_deg": shift,
+                "contraction": shift * 0.01,
+                "elastic_scale": elastic,
+            }
+            for shift, elastic in ((4.0, 2.0), (0.0, 0.0), (-2.0, -1.0))
+        ]
+        state_indices = np.asarray([0, 0, 0, 1, 1, 2], np.int32)
+        unchanged, metadata = _recenter_elastic_motion_states(
+            states,
+            state_indices,
+            OmegaConf.create({"recenter_motion_field": False}),
+            elastic_max_displacement_mm=2.0,
+        )
+        self.assertEqual(unchanged, states)
+        self.assertFalse(metadata["motion_recentered"])
+        cfg = OmegaConf.create(
+            {
+                "recenter_motion_field": True,
+                "recenter_mode": "view_weighted_mean",
+                "recenter_affine": True,
+                "recenter_elastic": True,
+                "max_centered_displacement_mm": 2.5,
+                "max_centered_rotation_deg": 1.5,
+                "max_centered_contraction": 0.02,
+            }
+        )
+        centered, metadata = _recenter_elastic_motion_states(
+            states, state_indices, cfg, elastic_max_displacement_mm=2.0
+        )
+        counts = np.bincount(state_indices, minlength=len(states))
+        for key in (
+            "shift_z_mm",
+            "shift_y_mm",
+            "shift_x_mm",
+            "rotation_deg",
+            "contraction",
+            "elastic_scale",
+        ):
+            self.assertAlmostEqual(
+                float(np.average([state[key] for state in centered], weights=counts)),
+                0.0,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                metadata["motion_post_recenter_view_weighted_mean"][key], 0.0, places=6
+            )
+        self.assertLess(metadata["motion_recenter_displacement_scale"], 1.0)
+        self.assertLessEqual(metadata["centered_max_nominal_displacement_mm"], 2.5)
+
+    def test_elastic_parallel_fbp_recenter_is_opt_in_and_reported(self):
+        clean, heart_mask = _phantom()
+        cfg = _small_config("elastic_parallel_fbp")
+        cfg.elastic_parallel_fbp.recenter_motion_field = True
+        cfg.elastic_parallel_fbp.recenter_mode = "view_weighted_mean"
+        cfg.elastic_parallel_fbp.recenter_affine = True
+        cfg.elastic_parallel_fbp.recenter_elastic = True
+        cfg.elastic_parallel_fbp.max_centered_displacement_mm = 2.5
+        cfg.elastic_parallel_fbp.max_centered_rotation_deg = 1.5
+        cfg.elastic_parallel_fbp.max_centered_contraction = 0.02
+        output, metadata = simulate_cac_motion(
+            clean,
+            [3.0, 0.5, 0.5],
+            cfg,
+            rng=np.random.default_rng(31),
+            heart_mask=heart_mask,
+            severity=0.8,
+        )
+        self.assertEqual(output.shape, clean.shape)
+        self.assertTrue(metadata["motion_recentered"])
+        for value in metadata["motion_post_recenter_view_weighted_mean"].values():
+            self.assertAlmostEqual(value, 0.0, places=6)
 
     def test_elastic_parallel_fbp_is_deterministic(self):
         clean, heart_mask = _phantom()

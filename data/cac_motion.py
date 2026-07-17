@@ -409,7 +409,149 @@ def _make_motion_states(clean, spacing, mask, config, params, num_states, rng):
     return volumes, phases
 
 
-def _make_elastic_motion_states(clean, spacing, mask, config, params, num_states, rng):
+def _motion_state_weighted_means(states, counts):
+    keys = (
+        "shift_z_mm",
+        "shift_y_mm",
+        "shift_x_mm",
+        "rotation_deg",
+        "contraction",
+        "elastic_scale",
+    )
+    return {
+        key: float(np.average([state[key] for state in states], weights=counts))
+        for key in keys
+    }
+
+
+def _recenter_elastic_motion_states(
+    states, state_indices, config, elastic_max_displacement_mm
+):
+    """既知stateのview加重平均motionを引き、gated座標の周囲へ再中心化する。"""
+    centered = [dict(state) for state in states]
+    counts = np.bincount(
+        np.asarray(state_indices, dtype=np.int32), minlength=len(centered)
+    ).astype(np.float64)
+    if len(centered) == 0 or len(counts) != len(centered) or not np.all(counts > 0.0):
+        raise ValueError(
+            "elastic motion stateには各1 view以上を割り当ててください: "
+            f"states={len(centered)}, counts={counts.tolist()}"
+        )
+    pre_mean = _motion_state_weighted_means(centered, counts)
+    enabled = bool(_get(config, "recenter_motion_field", False))
+    recenter_scale = 1.0
+
+    if enabled:
+        mode = str(_get(config, "recenter_mode", "view_weighted_mean")).lower()
+        if mode != "view_weighted_mean":
+            raise ValueError(
+                f"elastic_parallel_fbp.recenter_modeはview_weighted_meanです: {mode}"
+            )
+        recenter_affine = bool(_get(config, "recenter_affine", True))
+        recenter_translation = bool(
+            _get(config, "recenter_translation", recenter_affine)
+        )
+        recenter_rotation = bool(_get(config, "recenter_rotation", recenter_affine))
+        recenter_contraction = bool(
+            _get(config, "recenter_contraction", recenter_affine)
+        )
+        recenter_elastic = bool(_get(config, "recenter_elastic", True))
+        for state in centered:
+            if recenter_translation:
+                for key in ("shift_z_mm", "shift_y_mm", "shift_x_mm"):
+                    state[key] = float(state[key]) - pre_mean[key]
+            if recenter_rotation:
+                state["rotation_deg"] = (
+                    float(state["rotation_deg"]) - pre_mean["rotation_deg"]
+                )
+            if recenter_contraction:
+                state["contraction"] = (
+                    float(state["contraction"]) - pre_mean["contraction"]
+                )
+            if recenter_elastic:
+                state["elastic_scale"] = (
+                    float(state["elastic_scale"]) - pre_mean["elastic_scale"]
+                )
+
+        # 並進とelasticを同じ係数で縮めれば、加重平均0を保持したまま上限を守れる。
+        max_displacement = _get(config, "max_centered_displacement_mm", None)
+        if max_displacement is not None:
+            max_displacement = float(max_displacement)
+            if not np.isfinite(max_displacement) or max_displacement <= 0.0:
+                raise ValueError(
+                    "max_centered_displacement_mmは正またはnullです: "
+                    f"{max_displacement}"
+                )
+            extent = max(
+                math.sqrt(
+                    float(state["shift_z_mm"]) ** 2
+                    + float(state["shift_y_mm"]) ** 2
+                    + float(state["shift_x_mm"]) ** 2
+                )
+                + abs(float(state["elastic_scale"]))
+                * float(elastic_max_displacement_mm)
+                for state in centered
+            )
+            if extent > max_displacement:
+                recenter_scale = max_displacement / extent
+                for state in centered:
+                    for key in (
+                        "shift_z_mm",
+                        "shift_y_mm",
+                        "shift_x_mm",
+                        "elastic_scale",
+                    ):
+                        state[key] = float(state[key]) * recenter_scale
+
+        max_rotation = _get(config, "max_centered_rotation_deg", None)
+        if max_rotation is not None:
+            max_rotation = float(max_rotation)
+            if not np.isfinite(max_rotation) or max_rotation <= 0.0:
+                raise ValueError(
+                    f"max_centered_rotation_degは正またはnullです: {max_rotation}"
+                )
+            actual = max(abs(float(state["rotation_deg"])) for state in centered)
+            if actual > max_rotation:
+                scale = max_rotation / actual
+                for state in centered:
+                    state["rotation_deg"] = float(state["rotation_deg"]) * scale
+
+        max_contraction = _get(config, "max_centered_contraction", None)
+        if max_contraction is not None:
+            max_contraction = float(max_contraction)
+            if not np.isfinite(max_contraction) or max_contraction <= 0.0:
+                raise ValueError(
+                    f"max_centered_contractionは正またはnullです: {max_contraction}"
+                )
+            actual = max(abs(float(state["contraction"])) for state in centered)
+            if actual > max_contraction:
+                scale = max_contraction / actual
+                for state in centered:
+                    state["contraction"] = float(state["contraction"]) * scale
+
+    post_mean = _motion_state_weighted_means(centered, counts)
+    actual_extent = max(
+        math.sqrt(
+            float(state["shift_z_mm"]) ** 2
+            + float(state["shift_y_mm"]) ** 2
+            + float(state["shift_x_mm"]) ** 2
+        )
+        + abs(float(state["elastic_scale"])) * float(elastic_max_displacement_mm)
+        for state in centered
+    )
+    return centered, {
+        "motion_recentered": enabled,
+        "motion_state_view_counts": [int(value) for value in counts],
+        "motion_pre_recenter_view_weighted_mean": pre_mean,
+        "motion_post_recenter_view_weighted_mean": post_mean,
+        "motion_recenter_displacement_scale": float(recenter_scale),
+        "centered_max_nominal_displacement_mm": float(actual_extent),
+    }
+
+
+def _make_elastic_motion_states(
+    clean, spacing, mask, config, params, num_states, state_indices, rng
+):
     target_phase = float(_get(config, "target_phase", 0.75))
     cfg_elastic = _get(config, "elastic_parallel_fbp", {})
     phases = _sample_phases(
@@ -418,20 +560,18 @@ def _make_elastic_motion_states(clean, spacing, mask, config, params, num_states
     elastic_field = generate_smooth_elastic_field_mm(
         clean.shape, spacing, mask, config, params, rng
     )
-    volumes = [
-        warp_cardiac_state(
-            clean,
-            spacing,
-            mask,
-            motion_state(float(phase), target_phase, params),
-            elastic_field_mm=elastic_field,
-        )
-        for phase in phases
-    ]
+    raw_states = [motion_state(float(phase), target_phase, params) for phase in phases]
     field_norm = np.sqrt(np.sum(elastic_field * elastic_field, axis=0))
     roi = np.asarray(mask) >= 0.25
     max_displacement = float(field_norm[roi].max()) if np.any(roi) else 0.0
-    return volumes, phases, max_displacement
+    states, recenter_details = _recenter_elastic_motion_states(
+        raw_states, state_indices, cfg_elastic, max_displacement
+    )
+    volumes = [
+        warp_cardiac_state(clean, spacing, mask, state, elastic_field_mm=elastic_field)
+        for state in states
+    ]
+    return volumes, phases, max_displacement, recenter_details
 
 
 def simulate_image_blend(clean_hu, spacing_zyx, mask, config, params, rng):
@@ -749,8 +889,13 @@ def _simulate_elastic_parallel_fbp_core(
     angles = start_angle + np.linspace(
         0.0, math.radians(angular_range), num_views, endpoint=False
     )
-    volumes, phases, max_elastic_displacement = _make_elastic_motion_states(
-        clean_hu, spacing, mask, config, params, num_states, rng
+    state_indices = np.minimum(
+        num_states - 1, np.arange(num_views) * num_states // num_views
+    )
+    volumes, phases, max_elastic_displacement, recenter_details = (
+        _make_elastic_motion_states(
+            clean_hu, spacing, mask, config, params, num_states, state_indices, rng
+        )
     )
 
     mu_water = float(_get(cfg_fbp, "mu_water_per_mm", 0.02))
@@ -763,9 +908,6 @@ def _simulate_elastic_parallel_fbp_core(
         padded, padding = _pad_axial_square(attenuation, cval=0.0)
         padded_states.append(padded.astype(np.float32, copy=False))
 
-    state_indices = np.minimum(
-        num_states - 1, np.arange(num_views) * num_states // num_views
-    )
     dynamic_sinogram = _project_with_backend(
         padded_states, angles, float(spacing[2]), state_indices, backend
     )
@@ -840,6 +982,7 @@ def _simulate_elastic_parallel_fbp_core(
         "projection_backend": backend,
         "projection_geometry": "axial_parallel_beam_elastic",
         "num_motion_states": num_states,
+        **recenter_details,
     }
 
 

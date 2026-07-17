@@ -105,6 +105,12 @@ python main.py --config conf/config_cac.yaml --overrides \
   1 mm XY gridで実行し、artifact残差だけをnative 0.5 mmへ戻してcleanへ加える。
   `null`にすると従来のnative grid投影へ戻る。出力JSONには投影shape、spacing、grid縮小率を
   `projection_shape_zyx`、`projection_spacing_zyx`、`projection_grid_fraction`として保存する。
+  CAC設定では`recenter_motion_field: true`により、各stateへ割り当てたview数で並進・回転・
+  収縮・elastic係数の加重平均を引いてから投影する。心拍位相由来の相対motion幅は残しつつ、
+  平均輪郭をgated座標へ戻す。`max_centered_displacement_mm`はrecenter後の並進normと
+  elastic最大変位の和を共通係数で制限するため、平均0を壊さず大変形を抑えられる。
+  metadataには補正前後の加重平均と適用scaleを保存する。従来挙動へ戻す場合は
+  `recenter_motion_field: false`を指定する。
   DGX Sparkのaarch64向けNGC 25.02 containerでは`astra-toolbox`のpip wheelがなく
   source buildも追加toolchainを要求するため、標準の`scipy` backendを推奨する。
 - `calcium_local_fbp`: gated CTを静的背景とCAC高吸収余剰成分へsoft分解し、CAC成分だけを

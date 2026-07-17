@@ -79,6 +79,18 @@ data:
       # 0で全viewを動的状態から生成。旧prototypeの50%静止混合は0.5で再現可能。
       static_projection_fraction: 0.0
       in_plane_blur_sigma_mm_range: [0.0, 0.4]
+      # 既知の各state変形からview加重平均を引き、平均輪郭をgated座標へ戻す。
+      recenter_motion_field: true
+      recenter_mode: view_weighted_mean
+      recenter_affine: true
+      recenter_translation: true
+      recenter_rotation: true
+      recenter_contraction: true
+      recenter_elastic: true
+      # recenter後の並進norm + elastic最大変位に対する共通上限。
+      max_centered_displacement_mm: 2.5
+      max_centered_rotation_deg: 1.5
+      max_centered_contraction: 0.02
       # full 512 matrixを投影せずheart周囲だけを処理し、境界でartifact差分をtaperする。
       crop_to_heart: true
       simulation_crop_margin_mm_zyx: [12.0, 20.0, 20.0]
