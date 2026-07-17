@@ -61,7 +61,7 @@ data:
       mu_water_per_mm: 0.02
       photon_count_range: [30000.0, 120000.0]
       add_poisson_noise: true
-      in_plane_blur_sigma_mm_range: [0.0, 0.4]
+      in_plane_blur_sigma_mm_range: [0.1, 0.6]
 
     elastic_parallel_fbp:
       # scipyは追加依存なし。astraはASTRA Toolboxを明示導入した環境で利用する。
@@ -87,10 +87,15 @@ data:
       recenter_rotation: true
       recenter_contraction: true
       recenter_elastic: true
+      # 平均0を保ったまま各stateの偏差を増幅し、短い撮影windowでもblurを確保する。
+      recenter_spread_gain: 1.5
       # recenter後の並進norm + elastic最大変位に対する共通上限。
       max_centered_displacement_mm: 2.5
       max_centered_rotation_deg: 1.5
       max_centered_contraction: 0.02
+      # 1 mm投影で弱まるsub-mm blurをnative heart ROIだけへ対称に補う。
+      native_blur_severity_power: 0.5
+      native_heart_blur_sigma_mm_range: [0.18, 0.55]
       # full 512 matrixを投影せずheart周囲だけを処理し、境界でartifact差分をtaperする。
       crop_to_heart: true
       simulation_crop_margin_mm_zyx: [12.0, 20.0, 20.0]

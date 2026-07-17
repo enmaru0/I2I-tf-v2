@@ -467,6 +467,7 @@ class CACMotionTests(unittest.TestCase):
                 "recenter_mode": "view_weighted_mean",
                 "recenter_affine": True,
                 "recenter_elastic": True,
+                "recenter_spread_gain": 1.5,
                 "max_centered_displacement_mm": 2.5,
                 "max_centered_rotation_deg": 1.5,
                 "max_centered_contraction": 0.02,
@@ -493,6 +494,7 @@ class CACMotionTests(unittest.TestCase):
                 metadata["motion_post_recenter_view_weighted_mean"][key], 0.0, places=6
             )
         self.assertLess(metadata["motion_recenter_displacement_scale"], 1.0)
+        self.assertEqual(metadata["motion_recenter_spread_gain"], 1.5)
         self.assertLessEqual(metadata["centered_max_nominal_displacement_mm"], 2.5)
 
     def test_elastic_parallel_fbp_recenter_is_opt_in_and_reported(self):
@@ -502,9 +504,12 @@ class CACMotionTests(unittest.TestCase):
         cfg.elastic_parallel_fbp.recenter_mode = "view_weighted_mean"
         cfg.elastic_parallel_fbp.recenter_affine = True
         cfg.elastic_parallel_fbp.recenter_elastic = True
+        cfg.elastic_parallel_fbp.recenter_spread_gain = 1.5
         cfg.elastic_parallel_fbp.max_centered_displacement_mm = 2.5
         cfg.elastic_parallel_fbp.max_centered_rotation_deg = 1.5
         cfg.elastic_parallel_fbp.max_centered_contraction = 0.02
+        cfg.elastic_parallel_fbp.native_blur_severity_power = 1.0
+        cfg.elastic_parallel_fbp.native_heart_blur_sigma_mm_range = [0.3, 0.3]
         output, metadata = simulate_cac_motion(
             clean,
             [3.0, 0.5, 0.5],
@@ -515,8 +520,14 @@ class CACMotionTests(unittest.TestCase):
         )
         self.assertEqual(output.shape, clean.shape)
         self.assertTrue(metadata["motion_recentered"])
+        self.assertEqual(metadata["motion_recenter_spread_gain"], 1.5)
+        self.assertGreater(metadata["native_heart_blur_sigma_mm"], 0.0)
         for value in metadata["motion_post_recenter_view_weighted_mean"].values():
             self.assertAlmostEqual(value, 0.0, places=6)
+        metrics = compare_cac_pair(
+            output, clean, [3.0, 0.5, 0.5], heart_mask=heart_mask
+        )
+        self.assertLess(metrics["centroid_distance_mm"], 0.5)
 
     def test_elastic_parallel_fbp_is_deterministic(self):
         clean, heart_mask = _phantom()

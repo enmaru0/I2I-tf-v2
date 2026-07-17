@@ -440,6 +440,7 @@ def _recenter_elastic_motion_states(
     pre_mean = _motion_state_weighted_means(centered, counts)
     enabled = bool(_get(config, "recenter_motion_field", False))
     recenter_scale = 1.0
+    spread_gain = 1.0
 
     if enabled:
         mode = str(_get(config, "recenter_mode", "view_weighted_mean")).lower()
@@ -472,6 +473,21 @@ def _recenter_elastic_motion_states(
                 state["elastic_scale"] = (
                     float(state["elastic_scale"]) - pre_mean["elastic_scale"]
                 )
+
+        spread_gain = float(_get(config, "recenter_spread_gain", 1.0))
+        if not np.isfinite(spread_gain) or spread_gain <= 0.0:
+            raise ValueError(f"recenter_spread_gainは正にしてください: {spread_gain}")
+        if spread_gain != 1.0:
+            for state in centered:
+                if recenter_translation:
+                    for key in ("shift_z_mm", "shift_y_mm", "shift_x_mm"):
+                        state[key] = float(state[key]) * spread_gain
+                if recenter_rotation:
+                    state["rotation_deg"] = float(state["rotation_deg"]) * spread_gain
+                if recenter_contraction:
+                    state["contraction"] = float(state["contraction"]) * spread_gain
+                if recenter_elastic:
+                    state["elastic_scale"] = float(state["elastic_scale"]) * spread_gain
 
         # 並進とelasticを同じ係数で縮めれば、加重平均0を保持したまま上限を守れる。
         max_displacement = _get(config, "max_centered_displacement_mm", None)
@@ -544,7 +560,11 @@ def _recenter_elastic_motion_states(
         "motion_state_view_counts": [int(value) for value in counts],
         "motion_pre_recenter_view_weighted_mean": pre_mean,
         "motion_post_recenter_view_weighted_mean": post_mean,
+        "motion_recenter_spread_gain": float(spread_gain),
         "motion_recenter_displacement_scale": float(recenter_scale),
+        "motion_recenter_effective_displacement_gain": float(
+            spread_gain * recenter_scale
+        ),
         "centered_max_nominal_displacement_mm": float(actual_extent),
     }
 
@@ -1670,6 +1690,33 @@ def simulate_elastic_parallel_fbp(clean_hu, spacing_zyx, mask, config, params, r
     )
     cropped_output = cropped_clean + native_residual
 
+    native_blur_power = float(_get(cfg_fbp, "native_blur_severity_power", 1.0))
+    if not np.isfinite(native_blur_power) or native_blur_power <= 0.0:
+        raise ValueError(
+            f"elastic native_blur_severity_powerは正にしてください: {native_blur_power}"
+        )
+    native_blur_scale = (
+        float(np.clip(params["severity"], 0.0, 1.0)) ** native_blur_power
+    )
+    native_heart_blur_sigma_mm = _sample_range(
+        rng,
+        _get(cfg_fbp, "native_heart_blur_sigma_mm_range", [0.0, 0.0]),
+        native_blur_scale,
+    )
+    if native_heart_blur_sigma_mm > 0.0:
+        spacing = np.asarray(spacing_zyx, dtype=np.float32)
+        blurred_output = gaussian_filter(
+            cropped_output,
+            sigma=(
+                0.0,
+                native_heart_blur_sigma_mm / spacing[1],
+                native_heart_blur_sigma_mm / spacing[2],
+            ),
+            mode="nearest",
+        )
+        heart_weight = np.clip(cropped_mask, 0.0, 1.0)
+        cropped_output += heart_weight * (blurred_output - cropped_output)
+
     crop_start = [int(item.start) for item in crop]
     crop_stop = [int(item.stop) for item in crop]
     full_crop = all(
@@ -1699,6 +1746,8 @@ def simulate_elastic_parallel_fbp(clean_hu, spacing_zyx, mask, config, params, r
         projection_clean.size / cropped_clean.size
     )
     details["native_residual_fusion"] = True
+    details["native_heart_blur_sigma_mm"] = float(native_heart_blur_sigma_mm)
+    details["native_blur_severity_power"] = float(native_blur_power)
     return output.astype(np.float32, copy=False), details
 
 
