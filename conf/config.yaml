@@ -163,6 +163,11 @@ data:
     slice_thickness_mm_range: [1.0, 6.0] # スライス厚[mm]（学習時はこの範囲でランダム）
     clamp_thickness_to_interval: true # スライス厚を間隔以下に制限する
     slice_profile: gaussian # gaussian(FWHM=スライス厚) / box(幅=スライス厚) / continuous(σ=k*スライス間隔) / none
+    # tensorflow: 物理位置で標本化する従来処理 / pytorch: torch/data.pyと同じzoom down/up
+    # pytorchはbox選択時だけ有効で、acquisition_orderとslice phaseは使用しない。
+    box_profile_implementation: tensorflow # tensorflow / pytorch
+    pytorch_box_interpolation_prefilter: true
+    pytorch_box_harmonize_thickness_to_interval: false
     continuous_sigma_k: 0.32 # slice_profile=continuous時のk
     slice_interpolation: linear # linear / spline / b-spline（b-splineはscipy.zoom prefilter=False）
     b_spline_order: 3 # slice_interpolation=b-spline時のscipy.zoom order（0〜5）

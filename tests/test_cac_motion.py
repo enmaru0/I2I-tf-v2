@@ -330,6 +330,13 @@ class CACMotionTests(unittest.TestCase):
         self.assertIn("edm_karras", cfg.algorithm)
         self.assertNotIn("extends", cfg)
 
+    def test_shift_tolerant_config_is_opt_in_for_real_pairs(self):
+        cfg = load_config_with_extends(Path("conf/config_cac_shift_tolerant.yaml"))
+        self.assertEqual(cfg.algorithm.name, "cac_shift_tolerant_regression")
+        self.assertEqual(cfg.data.pair_matching.method, "stem_token")
+        self.assertEqual(cfg.algorithm.cac_regression.threshold_hu, 130.0)
+        self.assertEqual(cfg.algorithm.cac_shift_tolerant_regression.shift_radius_xy, 2)
+
     def test_reference_phase_is_identity_state(self):
         params = {
             "second_harmonic": 0.2,

@@ -170,6 +170,17 @@ def read_cfg_and_parse_arg():
                 "data.self_sr.continuous_sigma_kは0以上で指定してください"
                 f"（現在: {cfg.data.self_sr.continuous_sigma_k}）"
             )
+        box_implementation = str(
+            cfg.data.self_sr.get("box_profile_implementation", "tensorflow")
+        ).lower()
+        assert box_implementation in ("tensorflow", "pytorch"), (
+            "data.self_sr.box_profile_implementationはtensorflow/pytorchで"
+            f"指定してください（現在: {box_implementation}）"
+        )
+        if box_implementation == "pytorch":
+            assert sr_profile == "box", (
+                "box_profile_implementation=pytorchはslice_profile=box専用です"
+            )
         sr_interp = str(cfg.data.self_sr.slice_interpolation).lower().replace("_", "-")
         assert sr_interp in (
             "linear",
@@ -187,6 +198,10 @@ def read_cfg_and_parse_arg():
             assert 0 <= b_spline_order <= 5, (
                 "data.self_sr.b_spline_orderは0〜5で指定してください"
                 f"（現在: {cfg.data.self_sr.b_spline_order}）"
+            )
+        if box_implementation == "pytorch":
+            assert sr_interp in ("linear", "spline"), (
+                "PyTorch互換box profileのslice_interpolationはlinear/splineです"
             )
         assert int(cfg.data.self_sr.acquisition_order) in (0, 1), (
             "data.self_sr.acquisition_orderは0または1を指定してください"
@@ -249,6 +264,27 @@ def read_cfg_and_parse_arg():
         f"algorithm.name={cfg.algorithm.name} は未実装です。"
         f"利用可能: {list(MODEL_REGISTRY.keys())}"
     )
+    if cfg.algorithm.name == "cac_shift_tolerant_regression":
+        cfg_algorithm = cfg.algorithm.cac_shift_tolerant_regression
+        assert 0 <= int(cfg_algorithm.shift_radius_xy) <= 4, (
+            "cac_shift_tolerant_regression.shift_radius_xyは0～4です"
+        )
+        assert int(cfg_algorithm.get("shift_radius_z", 0)) == 0, (
+            "AX 3 mm CACではshift_radius_z=0のみ対応します"
+        )
+        assert float(cfg_algorithm.shift_selection_sigma_px) >= 0.0, (
+            "shift_selection_sigma_pxは0以上です"
+        )
+        assert float(cfg_algorithm.get("shift_selection_penalty", 0.0)) >= 0.0, (
+            "shift_selection_penaltyは0以上です"
+        )
+        assert str(cfg_algorithm.shift_selection_mode).lower() in ("hard", "softmin"), (
+            "shift_selection_modeはhard/softminで指定してください"
+        )
+        if str(cfg_algorithm.shift_selection_mode).lower() == "softmin":
+            assert float(cfg_algorithm.softmin_temperature) > 0.0, (
+                "softmin_temperatureは正の値を指定してください"
+            )
     if cfg.algorithm.name in ("edm", "edm_karras", "conditional_restoration_ode"):
         cfg_algorithm = cfg.algorithm[cfg.algorithm.name]
         assert int(cfg_algorithm.num_steps) >= 1, (

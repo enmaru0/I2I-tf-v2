@@ -1,0 +1,18 @@
+# PyTorch版ThroughPlaneSuperResolutionのbox profile処理と一致させるopt-in設定。
+# 既存のself_sr挙動はconfig.yamlのbox_profile_implementation=tensorflowで維持する。
+extends: config.yaml
+
+exp_dir: results/self_sr_pytorch_box
+
+data:
+  mode: self_sr
+  self_sr:
+    slice_profile: box
+    box_profile_implementation: pytorch
+    # torch/config.yamlの標準値と一致。
+    slice_interpolation: linear
+    pytorch_box_interpolation_prefilter: true
+    pytorch_box_harmonize_thickness_to_interval: false
+    # PyTorch互換経路では位相付き標本化を行わないため、明示的に無効化する。
+    random_slice_phase: false
+    val_slice_phase_px: 0

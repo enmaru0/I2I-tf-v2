@@ -5,6 +5,7 @@ from unittest import mock
 import tensorflow as tf
 import numpy as np
 from omegaconf import OmegaConf
+from scipy.ndimage import gaussian_filter, uniform_filter1d, zoom
 
 import trainers.base as base_module
 from callbacks.concise_progbar import ConciseProgbarLogger
@@ -15,6 +16,7 @@ from data.dataloader import (
     apply_random_contrast_augmentation,
     make_batch_dict,
     resolve_target_hdr_path,
+    simulate_through_plane_sr,
     simulate_kspace_noise,
     simulate_lowfield_noise,
     simulate_rician_noise,
@@ -303,6 +305,82 @@ class Stage1RegressionTests(unittest.TestCase):
         self.assertEqual(reconstructed.shape, volume.shape)
         np.testing.assert_allclose(reconstructed[0], samples[0])
         np.testing.assert_allclose(reconstructed[-1], samples[-1])
+
+    def test_pytorch_box_profile_matches_torch_zoom_pipeline_exactly(self):
+        clean = np.linspace(-0.5, 1.5, 7 * 13 * 9, dtype=np.float32).reshape(7, 13, 9)
+        axis_dim = 1
+        axis_spacing_mm = 0.8
+        slice_interval_mm = 3.7
+        slice_thickness_mm = 2.2
+        interval_px = slice_interval_mm / axis_spacing_mm
+        thickness_px = slice_thickness_mm / axis_spacing_mm
+
+        def torch_resize(volume, out_n, order, prefilter):
+            if volume.shape[0] == out_n:
+                return volume.astype(np.float32, copy=False)
+            if order > 1 and volume.shape[0] < 4:
+                order = 1
+            output = zoom(
+                volume,
+                (out_n / volume.shape[0], 1.0, 1.0),
+                order=order,
+                prefilter=prefilter,
+            )
+            return output.astype(np.float32, copy=False)
+
+        for order, prefilter, harmonize in ((1, True, False), (3, True, True)):
+            with self.subTest(order=order, prefilter=prefilter, harmonize=harmonize):
+                axis_first = np.moveaxis(clean, axis_dim, 0)
+                expected = uniform_filter1d(
+                    axis_first,
+                    size=max(1, int(round(thickness_px))),
+                    axis=0,
+                    mode="nearest",
+                ).astype(np.float32, copy=False)
+                if harmonize and interval_px > thickness_px + 1e-6:
+                    sigma = np.sqrt(interval_px**2 - thickness_px**2) / 2.3548
+                    expected = gaussian_filter(
+                        expected, sigma=(sigma, 0.0, 0.0)
+                    ).astype(np.float32, copy=False)
+                n_axis = axis_first.shape[0]
+                low_axis = int(round((n_axis - 1) / interval_px)) + 1
+                low_axis = max(1, min(n_axis, low_axis))
+                expected = torch_resize(expected, low_axis, order, prefilter)
+                expected = torch_resize(expected, n_axis, order, prefilter)
+                expected = np.moveaxis(expected, 0, axis_dim)
+
+                actual = simulate_through_plane_sr(
+                    clean,
+                    axis_dim,
+                    axis_spacing_mm,
+                    slice_interval_mm,
+                    slice_thickness_mm,
+                    slice_profile="box",
+                    interpolation_order=order,
+                    # PyTorch互換時には以下の従来TF sampling設定を無視する。
+                    acquisition_order=0,
+                    slice_phase_px=3,
+                    box_profile_implementation="pytorch",
+                    pytorch_box_interpolation_prefilter=prefilter,
+                    pytorch_box_harmonize_thickness_to_interval=harmonize,
+                )
+                np.testing.assert_array_equal(actual, expected)
+
+    def test_tensorflow_box_profile_remains_the_default(self):
+        clean = np.arange(11 * 3 * 2, dtype=np.float32).reshape(11, 3, 2)
+        default = simulate_through_plane_sr(
+            clean, 0, 1.0, 3.2, 2.4, slice_profile="box"
+        )
+        explicit = simulate_through_plane_sr(
+            clean,
+            0,
+            1.0,
+            3.2,
+            2.4,
+            slice_profile="box",
+            box_profile_implementation="tensorflow",
+        )
+        np.testing.assert_array_equal(default, explicit)
 
     def test_affine_image_interpolation_preserves_float_output(self):
         transform = AffineTransform(

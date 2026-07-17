@@ -1,0 +1,37 @@
+# 数pixelの位置ずれが残るnon-gated/gated実ペア用のopt-in config。
+# 既存のconfig_cac.yaml / config_cac_real.yamlとcac_regressionは変更しない。
+extends: config_cac_real.yaml
+
+exp_dir: results/cac_real_shift_tolerant
+
+algorithm:
+  name: cac_shift_tolerant_regression
+  cac_shift_tolerant_regression:
+    output_mode: residual
+    threshold_hu: 130.0
+
+    # 0.5 mm/pixelの面内だけでcrop共通の平行移動を探索する。
+    # ±2 pixel = ±1.0 mm。AX 3 mmのz方向shiftは許容しない。
+    shift_radius_xy: 2
+    shift_radius_z: 0
+    shift_selection_sigma_px: 1.5
+    # CACそのものへshiftを過適合させず、低HUの低周波解剖構造で選ぶ。
+    shift_selection_max_hu: 100.0
+    # 一様領域や同点ではzero shiftを優先する微小な二乗距離penalty。
+    shift_selection_penalty: 0.0001
+    shift_selection_mode: hard # hard / softmin
+    softmin_temperature: 0.01
+
+    # 完全一致L1を弱く残し、許容範囲を超える位置ずれは学習対象にしない。
+    l1_weight: 0.25
+    shift_tolerant_l1_weight: 1.0
+    cac_shift_tolerant_weight: 2.0
+    gradient_weight: 0.25
+    gradient_axes: [y, x]
+
+    # 出力がsourceの低周波輪郭から移動することを防ぐanchor。
+    source_anatomy_weight: 0.25
+    source_anatomy_max_hu: 100.0
+    source_anatomy_sigma_px: 2.0
+    # 平行移動に不変なCAC高吸収余剰成分の総量を補助監督する。
+    cac_mass_weight: 1.0

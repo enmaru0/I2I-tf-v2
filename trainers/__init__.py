@@ -4,6 +4,7 @@ from models import build_patch_discriminator, build_unet
 
 from .base import BaseI2ITrainer
 from .cac_regression import CACRegressionTrainer
+from .cac_shift_tolerant_regression import CACShiftTolerantRegressionTrainer
 from .conditional_restoration_ode import ConditionalRestorationODETrainer
 from .edm import EDMTrainer
 from .edm_karras import EDMKarrasTrainer
@@ -19,6 +20,7 @@ from .split_mean_flow import SplitMeanFlowTrainer
 MODEL_REGISTRY = {
     "regression": RegressionTrainer,
     "cac_regression": CACRegressionTrainer,
+    "cac_shift_tolerant_regression": CACShiftTolerantRegressionTrainer,
     "pix2pix": Pix2PixTrainer,
     "edm": EDMTrainer,
     "edm_karras": EDMKarrasTrainer,
@@ -86,6 +88,10 @@ def build_trainer(cfg, input_shape) -> BaseI2ITrainer:
         trainer = CACRegressionTrainer(
             generator, gradient_accumulation_steps=gradient_accumulation_steps
         )
+    elif name == "cac_shift_tolerant_regression":
+        trainer = CACShiftTolerantRegressionTrainer(
+            generator, gradient_accumulation_steps=gradient_accumulation_steps
+        )
     elif name == "pix2pix":
         discriminator = build_patch_discriminator(
             input_shape, **cfg.algorithm.pix2pix.discriminator
@@ -140,6 +146,8 @@ def build_trainer(cfg, input_shape) -> BaseI2ITrainer:
 __all__ = [
     "BaseI2ITrainer",
     "RegressionTrainer",
+    "CACRegressionTrainer",
+    "CACShiftTolerantRegressionTrainer",
     "Pix2PixTrainer",
     "EDMTrainer",
     "EDMKarrasTrainer",

@@ -352,6 +352,75 @@ def _resize_axis0(
     return out.astype(np.float32, copy=False)
 
 
+def _resize_axis0_pytorch_compatible(
+    vol: np.ndarray, out_n: int, order: int = 1, prefilter: bool = True
+) -> np.ndarray:
+    """torch/data.pyのThroughPlaneSuperResolution._resize_zと同じzoom処理。"""
+    out_n = int(out_n)
+    if out_n < 1:
+        raise ValueError("out_n must be >= 1")
+    if vol.shape[0] == out_n:
+        return vol.astype(np.float32, copy=False)
+
+    order = int(order)
+    if order > 1 and vol.shape[0] < 4:
+        order = 1
+    # modeを指定しないこともPyTorch版と同じ。scipy.zoom既定の
+    # mode="constant", cval=0.0, grid_mode=Falseを使用する。
+    out = zoom(
+        vol, (out_n / vol.shape[0], 1.0, 1.0), order=order, prefilter=bool(prefilter)
+    )
+    if out.shape[0] > out_n:
+        start = (out.shape[0] - out_n) // 2
+        out = out[start : start + out_n]
+    elif out.shape[0] < out_n:
+        pad_before = (out_n - out.shape[0]) // 2
+        pad_after = out_n - out.shape[0] - pad_before
+        out = np.pad(out, ((pad_before, pad_after), (0, 0), (0, 0)), mode="edge")
+    return out.astype(np.float32, copy=False)
+
+
+def _simulate_pytorch_box_profile_axis0(
+    axis_first: np.ndarray,
+    interval_px: float,
+    thickness_px: float,
+    interpolation_order: int,
+    interpolation_prefilter: bool,
+    harmonize_slice_thickness_to_interval: bool = False,
+) -> np.ndarray:
+    """PyTorch版physical reductionのbox profile経路をそのまま再現する。"""
+    profiled = axis_first.astype(np.float32, copy=False)
+    if thickness_px > 1.0:
+        size = max(1, int(round(float(thickness_px))))
+        if size > 1:
+            profiled = uniform_filter1d(
+                profiled, size=size, axis=0, mode="nearest"
+            ).astype(np.float32, copy=False)
+
+    if bool(harmonize_slice_thickness_to_interval):
+        interval_px = float(interval_px)
+        thickness_px = float(thickness_px)
+        if interval_px > thickness_px + 1e-6:
+            add_fwhm_px = np.sqrt(
+                max(interval_px * interval_px - thickness_px * thickness_px, 0.0)
+            )
+            harmonize_sigma_px = float(add_fwhm_px / 2.3548)
+            if harmonize_sigma_px > 0.0:
+                profiled = gaussian_filter(
+                    profiled, sigma=(harmonize_sigma_px, 0.0, 0.0)
+                ).astype(np.float32, copy=False)
+
+    n_axis = int(axis_first.shape[0])
+    low_axis = int(round((n_axis - 1) / float(interval_px))) + 1 if n_axis > 1 else 1
+    low_axis = max(1, min(n_axis, low_axis))
+    lowres = _resize_axis0_pytorch_compatible(
+        profiled, low_axis, order=interpolation_order, prefilter=interpolation_prefilter
+    )
+    return _resize_axis0_pytorch_compatible(
+        lowres, n_axis, order=interpolation_order, prefilter=interpolation_prefilter
+    )
+
+
 def _sample_axis0(
     vol: np.ndarray, interval_px: float, phase_px: int = 0, order: int = 1
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -407,6 +476,9 @@ def simulate_through_plane_sr(
     continuous_sigma_k: float = CONTINUOUS_SR_SIGMA_FACTOR,
     acquisition_order: int = 1,
     slice_phase_px: int = 0,
+    box_profile_implementation: str = "tensorflow",
+    pytorch_box_interpolation_prefilter: bool = True,
+    pytorch_box_harmonize_thickness_to_interval: bool = False,
 ) -> np.ndarray:
     """
     スライス方向の低解像度撮像をシミュレートする（edm-torchの
@@ -415,7 +487,8 @@ def simulate_through_plane_sr(
        - gaussian: FWHM=スライス厚
        - box: 幅=スライス厚
        - continuous: sigma=スライス間隔*k
-    2. スライス間隔・位相に合わせて低解像度グリッドで標本化
+    2. 標準TF方式はスライス間隔・位相に合わせて物理位置で標本化
+       PyTorch互換box方式はtorch/data.pyと同じ枚数へzoom downsample
     3. 元グリッドへ補間で戻す（出力サイズは入力と同じ）
     """
     axis_first = np.moveaxis(img.astype(np.float32, copy=False), axis_dim, 0)
@@ -423,6 +496,23 @@ def simulate_through_plane_sr(
     thickness_px = max(float(slice_thickness_mm) / float(axis_spacing_mm), 1.0)
 
     slice_profile = str(slice_profile).lower()
+    box_profile_implementation = str(box_profile_implementation).lower()
+    if box_profile_implementation not in ("tensorflow", "pytorch"):
+        raise ValueError(
+            "box_profile_implementationはtensorflow/pytorchです: "
+            f"{box_profile_implementation}"
+        )
+    if slice_profile == "box" and box_profile_implementation == "pytorch":
+        upsampled = _simulate_pytorch_box_profile_axis0(
+            axis_first,
+            interval_px,
+            thickness_px,
+            interpolation_order,
+            pytorch_box_interpolation_prefilter,
+            pytorch_box_harmonize_thickness_to_interval,
+        )
+        return np.moveaxis(upsampled, 0, axis_dim).astype(np.float32, copy=False)
+
     if slice_profile == "none":
         pass
     elif slice_profile == "gaussian" and thickness_px <= 1.0:
@@ -602,7 +692,12 @@ def apply_random_self_sr(
         slice_thickness_mm = min(slice_thickness_mm, slice_interval_mm)
     interval_px = max(float(slice_interval_mm) / float(norm_spacing_zyx[axis_dim]), 1.0)
     phase_px = 0
-    if bool(cfg_sr.get("random_slice_phase", False)):
+    pytorch_box = (
+        str(cfg_sr.slice_profile).lower() == "box"
+        and str(cfg_sr.get("box_profile_implementation", "tensorflow")).lower()
+        == "pytorch"
+    )
+    if bool(cfg_sr.get("random_slice_phase", False)) and not pytorch_box:
         phase_px = int(np_rng.integers(0, max(1, int(np.ceil(interval_px)))))
     return simulate_through_plane_sr(
         clean,
@@ -616,6 +711,15 @@ def apply_random_self_sr(
         continuous_sigma_k=cfg_sr.get("continuous_sigma_k", CONTINUOUS_SR_SIGMA_FACTOR),
         acquisition_order=int(cfg_sr.get("acquisition_order", 1)),
         slice_phase_px=phase_px,
+        box_profile_implementation=cfg_sr.get(
+            "box_profile_implementation", "tensorflow"
+        ),
+        pytorch_box_interpolation_prefilter=cfg_sr.get(
+            "pytorch_box_interpolation_prefilter", True
+        ),
+        pytorch_box_harmonize_thickness_to_interval=cfg_sr.get(
+            "pytorch_box_harmonize_thickness_to_interval", False
+        ),
     )
 
 
@@ -884,6 +988,15 @@ def preprocess_image_np(
                 ),
                 acquisition_order=int(cfg_sr.get("acquisition_order", 1)),
                 slice_phase_px=int(cfg_sr.get("val_slice_phase_px", 0)),
+                box_profile_implementation=cfg_sr.get(
+                    "box_profile_implementation", "tensorflow"
+                ),
+                pytorch_box_interpolation_prefilter=cfg_sr.get(
+                    "pytorch_box_interpolation_prefilter", True
+                ),
+                pytorch_box_harmonize_thickness_to_interval=cfg_sr.get(
+                    "pytorch_box_harmonize_thickness_to_interval", False
+                ),
             )
         tgt_min_val, tgt_max_val = src_min_val, src_max_val
     else:

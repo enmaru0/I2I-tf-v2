@@ -52,6 +52,25 @@ python main.py --config conf/config_cac_real.yaml --overrides \
     data.target_data_dir=/data/cac/gated
 ```
 
+剛体位置合わせ後にも実ペアへ数pixelの面内ずれが残る場合は、既存学習を変えず
+[`conf/config_cac_shift_tolerant.yaml`](conf/config_cac_shift_tolerant.yaml)をopt-inで使える。
+標準値は0.5 mm/pixelで±2 pixel（±1.0 mm）を探索し、non-gated入力とgated教師の
+低周波・100 HU未満の解剖構造からcropごとに1つの共通XY shiftを選ぶ。同じshiftを位置ずれ許容L1、
+130 HU以上のCAC loss、面内edge lossへ適用する。さらに入力の低周波輪郭をanchorにし、
+出力構造そのものが移動する解を抑える。z方向はAX 3 mmなので探索しない。
+
+```bash
+python main.py --config conf/config_cac_shift_tolerant.yaml --overrides \
+    data_dir=/data/cac/non_gated \
+    data.target_data_dir=/data/cac/gated
+```
+
+`shift_radius_xy`を大きくすると「対応ずれを無視できる範囲」も広がるため、標準の2から始め、
+実ペアの残存位置ずれ分布を超えて増やさない。完全一致L1も弱い重みで残している。
+このtrainerのPSNR/SSIMは選択したshift後の値で、`l1_loss`は未補正座標の監視値、
+`shift_l1_loss`はshift補正後の監視値となる。`shift_mean_*_px`と`shift_abs_*_px`で
+残存位置ずれの方向バイアスと大きさも監視できる。
+
 単一時相gated CTから合成ペアを事前生成する場合、入力は既存datasetと同じ
 `{train,val}/<dataset>/*.hdr`構造にする。
 
@@ -159,6 +178,8 @@ python utils/summarize_cac_pairs.py \
 
 推奨手順は、合成ペアで`cac_regression`をpretrainし、実ペアだけでfinetuneする方法。
 `cac_regression`は通常L1に加え、130 HU以上のtarget領域と0.5 mm面内edgeを重くする。
+実ペアに±1 mm程度の残存並進がある場合だけ、finetune側を
+`cac_shift_tolerant_regression`へ切り替える。
 これらの統計・lossは研究用であり、診断用Agatston score実装ではない。
 
 ## アルゴリズム
@@ -170,6 +191,7 @@ python utils/summarize_cac_pairs.py \
 |---|---|---|---|
 | `regression` | U-Net回帰 (L1/L2/SSIM損失) | 1 forward | ベースライン。residual/direct出力 |
 | `cac_regression` | CAC重み付き残差回帰 | 1 forward | 130 HU以上と面内edgeを追加監督。CAC専用configで使用 |
+| `cac_shift_tolerant_regression` | 微小位置ずれ耐性CAC回帰 | 1 forward | 低周波構造でcrop共通XY shiftを選び、CAC/edge/総量を監督 |
 | `pix2pix` | 条件付きGAN + L1 | 1 forward | 3D PatchGAN。optimizerはadamw推奨 |
 | `edm_karras` | EDM (Karras 2022) | 2N-1 forwards | Heun/Euler、`edm`は後方互換名 |
 | `conditional_restoration_ode` | 条件付きrestoration ODE | 2N-1 forwards | PyTorch版の従来EDM目的関数を移植 |
@@ -215,12 +237,28 @@ python predict.py results/reg/checkpoints/model_best.keras
 python predict.py results/sr/checkpoints/model_best.keras \
     --native-xy-residual --target-z-spacing-mm 1.0
 
+# PyTorch版と同じbox profile + zoom down/upでself-SR学習
+python main.py --config conf/config_self_sr_pytorch_box.yaml --overrides \
+    data_dir=/data/clean
+
 # 同一seed・optimizer・step予算で主要手法を比較（時間予算はbudget_mode=minutes）
 python compare_algorithms.py --exp_root results/compare \
     --algorithms regression i2i_rfr_x0 resshift \
     --budget_mode steps --budget 100000 --seeds 0 1 2 \
     --overrides data.mode=self_sr
 ```
+
+`config_self_sr_pytorch_box.yaml`は`data.self_sr.box_profile_implementation=pytorch`
+を有効にするopt-in設定。PyTorchの`ThroughPlaneSuperResolution` physical modeと同じく、
+box filter後に `low_n=round((n-1)/interval_px)+1` を計算し、SciPy `zoom`でlow_n枚へ
+縮小してから同じ補間条件で元枚数へ戻す。PyTorchにはslice phaseと独立したacquisition
+補間がないため、この経路では`random_slice_phase`、`val_slice_phase_px`、
+`acquisition_order`を使用しない。既存の物理位置標本化は
+`box_profile_implementation=tensorflow`として変更せず残している。
+
+同一入力、axis spacing、interval、thickness、補間設定、SciPy versionなら両実装の出力は
+一致する。PyTorch側で`harmonize_slice_thickness_to_interval=true`を使う場合は、TensorFlow側の
+`pytorch_box_harmonize_thickness_to_interval`も`true`にする。
 
 比較時は `reproducibility.seed` からcrop・劣化・生成初期ノイズを固定する。評価は症例単位の
 PSNR/MAEとz/y/x方向SSIMを使い、`evaluation.val_patches_per_volume` 個の固定パッチを取る。
