@@ -18,7 +18,10 @@ from inference_utils import (
     sliding_window_predict,
 )
 from main import gpu_setting, prepare_data_dict
-from trainers import BaseI2ITrainer, build_trainer
+from trainers import (
+    MODEL_REGISTRY,
+    BaseI2ITrainer,
+)
 
 tf.config.run_functions_eagerly(True)
 
@@ -27,6 +30,26 @@ def load_checkpoint(checkpoint_path) -> tuple[BaseI2ITrainer, int]:
     model = keras.models.load_model(checkpoint_path, safe_mode=False)
     step = model.optimizer.iterations.numpy()
     return model, step
+
+
+def prepare_loaded_model_for_inference(model: BaseI2ITrainer, cfg):
+    """Serialized checkpointの構造を維持したまま推論設定を接続する。
+
+    predict.pyでconfigからmodelを再構築してset_weightsすると、学習後に入力
+    チャンネル数やU-Net設定が変わったcheckpointでshape mismatchになる。
+    checkpointにはgenerator/trainerの構造が保存されているため、それを正とする。
+    """
+    expected_class = MODEL_REGISTRY.get(str(cfg.algorithm.name))
+    if expected_class is not None and type(model) is not expected_class:
+        logging.warning(
+            "Checkpoint trainer (%s) differs from output.yaml algorithm (%s -> %s). "
+            "Using the serialized checkpoint trainer architecture.",
+            type(model).__name__,
+            cfg.algorithm.name,
+            expected_class.__name__,
+        )
+    model.cfg = cfg
+    return model
 
 
 def rescale_pred_to_org(pred, out_size_zyx):
@@ -142,7 +165,8 @@ if __name__ == "__main__":
     test_loader = create_dataloader_test(val_dict, cfg)
 
     # モデルを読み込む
-    _model, step = load_checkpoint(checkpoint_path)
+    model, step = load_checkpoint(checkpoint_path)
+    model = prepare_loaded_model_for_inference(model, cfg)
     logging.info(f"Loaded from: {checkpoint_path} (step: {step})")
 
     cfg_infer = cfg.get("inference", {})
@@ -176,11 +200,6 @@ if __name__ == "__main__":
         if configured_patch is None
         else tuple(configured_patch)
     )
-    model_shape = patch_size_zyx + (1,) if use_sliding_window else (None, None, None, 1)
-    model: BaseI2ITrainer = build_trainer(cfg, model_shape)
-    # 読み込んだコピーをセットする
-    model.set_weights(_model.get_weights())
-
     for data in tqdm(test_loader):
         key = data["img_key"].numpy().decode()
         cfg_repro = cfg.get("reproducibility", {})
