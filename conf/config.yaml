@@ -37,8 +37,17 @@ inference:
   patch_size_zyx: null
   overlap: 0.5
   batch_size: 1
+  # auto: self_srはnative XYを保ったdense-z、それ以外は従来のoriginal gridで保存。
+  # originalを明示するとself_srでも元の粗いスライス間隔へ戻す。
+  output_grid: auto # auto / original / dense_z
+  dense_z:
+    # nullならaug.affine.norm_spacing_zyx[0]。入力より粗くはしない。
+    target_z_spacing_mm: null
+    interpolation_order: 1
+    never_downsample: true
+    filename_suffix: ".sr.pred"
   # 1 mm modelの補正残差だけをnative XY gridへ戻すthrough-plane SR推論。
-  # 通常推論は変更せず、residual outputのmodelでのみopt-in利用する。
+  # dense_z直接出力とは別方式で、residual outputのmodelでのみopt-in利用する。
   native_xy_residual:
     enabled: false
     # nullならaug.affine.norm_spacing_zyx[0]を出力z spacingに使う。

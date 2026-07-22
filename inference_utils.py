@@ -50,6 +50,57 @@ def shape_for_spacing(shape_zyx, source_spacing_zyx, target_spacing_zyx) -> np.n
     return np.rint((shape - 1) * source_spacing / target_spacing).astype(np.int64) + 1
 
 
+def resample_prediction_to_dense_z(
+    model_prediction: np.ndarray,
+    native_shape_zyx,
+    native_spacing_zyx,
+    target_z_spacing_mm: float,
+    interpolation_order: int = 1,
+    never_downsample: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Model-grid predictionをnative XY・高密度z gridへ変換する。
+
+    ``model_prediction``はテスト入力全体と同じ物理範囲を表すものとする。
+    nativeの面内spacingは変更せず、z spacingだけを指定値へ変更する。
+    ``never_downsample``がTrueなら、既に薄い入力のz spacingを粗くしない。
+    """
+    prediction = np.asarray(model_prediction, np.float32)
+    if prediction.ndim == 4 and prediction.shape[-1] == 1:
+        prediction = prediction[..., 0]
+    if prediction.ndim != 3:
+        raise ValueError(
+            f"model_predictionは3D volumeにしてください: {prediction.shape}"
+        )
+    if not np.all(np.isfinite(prediction)):
+        raise FloatingPointError("model_predictionにNaN/Infがあります")
+
+    native_shape = np.asarray(native_shape_zyx, np.int64)
+    native_spacing = np.asarray(native_spacing_zyx, np.float32)
+    if native_shape.shape != (3,) or np.any(native_shape < 1):
+        raise ValueError(f"native_shape_zyxが不正です: {native_shape_zyx}")
+    if native_spacing.shape != (3,) or np.any(native_spacing <= 0.0):
+        raise ValueError(f"native_spacing_zyxが不正です: {native_spacing_zyx}")
+
+    target_z = float(target_z_spacing_mm)
+    if not np.isfinite(target_z) or target_z <= 0.0:
+        raise ValueError(
+            f"target_z_spacing_mmは正にしてください: {target_z_spacing_mm}"
+        )
+    if never_downsample:
+        target_z = min(target_z, float(native_spacing[0]))
+
+    output_spacing = native_spacing.copy()
+    output_spacing[0] = target_z
+    output_shape = shape_for_spacing(native_shape, native_spacing, output_spacing)
+    output = resize_volume_to_shape(
+        prediction,
+        output_shape,
+        order=int(interpolation_order),
+        anti_alias=True,
+    )
+    return output.astype(np.float32, copy=False), output_spacing
+
+
 def fuse_native_xy_residual(
     native_volume: np.ndarray,
     native_spacing_zyx,

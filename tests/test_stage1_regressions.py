@@ -25,6 +25,7 @@ from data.utils import AffineTransform
 from losses import masked_psnr_per_sample, ssim_per_sample
 from inference_utils import (
     fuse_native_xy_residual,
+    resample_prediction_to_dense_z,
     resize_volume_to_shape,
     shape_for_spacing,
     sliding_window_predict,
@@ -39,6 +40,29 @@ class Stage1RegressionTests(unittest.TestCase):
     def test_shape_for_spacing_preserves_voxel_center_extent(self):
         shape = shape_for_spacing((3, 8, 10), (4.0, 0.5, 0.4), (1.0, 0.5, 0.4))
         np.testing.assert_array_equal(shape, [9, 8, 10])
+
+    def test_dense_z_output_preserves_native_xy_and_increases_slice_count(self):
+        prediction = np.arange(5 * 4 * 6, dtype=np.float32).reshape(5, 4, 6)
+        output, spacing = resample_prediction_to_dense_z(
+            prediction,
+            native_shape_zyx=(3, 8, 10),
+            native_spacing_zyx=(4.0, 0.5, 0.4),
+            target_z_spacing_mm=1.0,
+        )
+        self.assertEqual(output.shape, (9, 8, 10))
+        np.testing.assert_allclose(spacing, [1.0, 0.5, 0.4])
+        self.assertTrue(np.isfinite(output).all())
+
+    def test_dense_z_output_does_not_make_thin_input_coarser(self):
+        prediction = np.ones((4, 4, 4), np.float32)
+        output, spacing = resample_prediction_to_dense_z(
+            prediction,
+            native_shape_zyx=(4, 4, 4),
+            native_spacing_zyx=(0.8, 0.5, 0.5),
+            target_z_spacing_mm=1.0,
+        )
+        self.assertEqual(output.shape, (4, 4, 4))
+        np.testing.assert_allclose(spacing, [0.8, 0.5, 0.5])
 
     def test_native_xy_zero_residual_preserves_native_in_plane_detail(self):
         native = np.zeros((3, 8, 10), np.float32)

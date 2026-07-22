@@ -230,8 +230,13 @@ python eval.py results/reg/checkpoints/model_best.keras
 # 生成系はサンプリングステップ数をスイープして最適値を探せる
 python eval.py results/edm/checkpoints/model_best.keras --num_steps 1,2,4,8,16
 
-# 推論（元画像空間に戻してrawで保存。標準ではsliding-window推論）
+# 推論（標準ではsliding-window推論）
 python predict.py results/reg/checkpoints/model_best.keras
+
+# self-SR: native XYを保ち、補完したz=1 mm gridで保存
+# data.mode=self_srではこのdense-z出力が既定動作
+python predict.py results/sr/checkpoints/model_best.keras \
+    --output-grid dense-z --target-z-spacing-mm 1.0
 
 # Through-plane SR: 1 mm model残差だけをnative XYへ戻し、z=1 mmで保存
 python predict.py results/sr/checkpoints/model_best.keras \
@@ -271,11 +276,17 @@ MRIでは`data.contrast_augmentation.enabled=True`により、gamma/scale/shift/
 smooth bias fieldを劣化simulation前のcleanへ適用できる。pairedデータでは同じ変換を
 source/targetへ共有する。
 
+`predict.py`は`data.mode=self_sr`のcheckpointでは、既定で補完結果を元の粗い
+スライス間隔へ戻さず、native XYを保持してzだけを
+`aug.affine.norm_spacing_zyx[0]`へ高密度化し、`*.sr.pred.hdr/.raw`として保存する。
+`--target-z-spacing-mm`で出力間隔を変更できる。既に入力のz spacingの方が細かい場合は
+既定では粗くしない。従来の粗いgridへ戻すには`--output-grid original`を指定する。
+
 `predict.py --native-xy-residual`は`output_mode=residual`のmodel専用opt-in推論。
 入力全体を学習時`norm_spacing_zyx`へ変換してmodel残差を求める一方、別経路では
 native XYを保持してzだけを`target-z-spacing-mm`へ補間する。残差だけをnative gridへ
 戻して加算し、出力spacingを`[target_z, native_y, native_x]`として保存する。
-学習時の`image.share_normalization=True`が必要で、標準推論の挙動は変更しない。
+学習時の`image.share_normalization=True`が必要。
 
 ## EMA（指数移動平均）
 

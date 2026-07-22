@@ -13,6 +13,7 @@ from tqdm import tqdm
 from data.dataloader_test import create_dataloader_test
 from inference_utils import (
     fuse_native_xy_residual,
+    resample_prediction_to_dense_z,
     resize_volume_to_shape,
     sliding_window_predict,
 )
@@ -42,6 +43,35 @@ def _native_xy_residual_settings(cfg, force_enabled=False, target_z_override=Non
     if target_z is None:
         target_z = float(cfg.aug.affine.norm_spacing_zyx[0])
     return enabled, float(target_z), cfg_native
+
+
+def _output_grid_settings(cfg, output_grid_override=None, target_z_override=None):
+    """通常予測の保存gridを解決する。self_srは既定でdense_zを使用する。"""
+    cfg_infer = cfg.get("inference", {})
+    output_grid = (
+        output_grid_override
+        if output_grid_override is not None
+        else cfg_infer.get("output_grid", "auto")
+    )
+    output_grid = str(output_grid).lower().replace("-", "_")
+    if output_grid == "auto":
+        output_grid = "dense_z" if str(cfg.data.mode) == "self_sr" else "original"
+    if output_grid not in ("original", "dense_z"):
+        raise ValueError(
+            "inference.output_gridはauto/original/dense_zを指定してください: "
+            f"{output_grid}"
+        )
+
+    cfg_dense = cfg_infer.get("dense_z", {})
+    target_z = cfg_dense.get("target_z_spacing_mm", None)
+    if target_z_override is not None:
+        target_z = target_z_override
+    if target_z is None:
+        target_z = float(cfg.aug.affine.norm_spacing_zyx[0])
+    target_z = float(target_z)
+    if not np.isfinite(target_z) or target_z <= 0.0:
+        raise ValueError(f"target_z_spacing_mmは正にしてください: {target_z}")
+    return output_grid, target_z, cfg_dense
 
 
 def _validate_native_xy_residual_mode(cfg, target_z_spacing_mm):
@@ -82,7 +112,13 @@ if __name__ == "__main__":
         "--target-z-spacing-mm",
         type=float,
         default=None,
-        help="native XY residual出力のz spacing。省略時は学習時norm spacing z",
+        help="dense-z/native XY residual出力のz spacing。省略時は学習時norm spacing z",
+    )
+    parser.add_argument(
+        "--output-grid",
+        choices=("auto", "original", "dense-z"),
+        default=None,
+        help="通常予測の保存grid。autoではself_srのみdense-z、それ以外はoriginal",
     )
     args = parser.parse_args()
 
@@ -117,11 +153,21 @@ if __name__ == "__main__":
             target_z_override=args.target_z_spacing_mm,
         )
     )
+    output_grid, dense_z_spacing_mm, cfg_dense_z = _output_grid_settings(
+        cfg,
+        output_grid_override=args.output_grid,
+        target_z_override=args.target_z_spacing_mm,
+    )
     if native_xy_enabled:
         _validate_native_xy_residual_mode(cfg, target_z_spacing_mm)
         logging.info(
             "Native XY residual inference enabled: target_z_spacing_mm=%.4f",
             target_z_spacing_mm,
+        )
+    elif output_grid == "dense_z":
+        logging.info(
+            "Dense-z self-SR output enabled: target_z_spacing_mm=%.4f",
+            dense_z_spacing_mm,
         )
     use_sliding_window = bool(cfg_infer.get("sliding_window", True))
     configured_patch = cfg_infer.get("patch_size_zyx", None)
@@ -194,16 +240,33 @@ if __name__ == "__main__":
             # [0,1] -> targetの強度レンジに戻す
             pred = pred * (tgt_max_val - tgt_min_val) + tgt_min_val
 
-            # 結果を元画像空間に戻す
-            out_size_zyx = crop_zyxzyx[3:6] - crop_zyxzyx[:3]
-            pred = rescale_pred_to_org(pred, out_size_zyx)
+            if output_grid == "dense_z":
+                out, output_spacing = resample_prediction_to_dense_z(
+                    pred,
+                    img_size_zyx,
+                    spacing_zyx,
+                    dense_z_spacing_mm,
+                    interpolation_order=int(
+                        cfg_dense_z.get("interpolation_order", 1)
+                    ),
+                    never_downsample=bool(
+                        cfg_dense_z.get("never_downsample", True)
+                    ),
+                )
+                suffix = str(cfg_dense_z.get("filename_suffix", ".sr.pred"))
+                save_path = save_dir / f"{key}{suffix}.hdr"
+                save_raw(_to_int16(out), output_spacing, save_path)
+            else:
+                # 従来動作：結果を元画像の粗いgridへ戻す
+                out_size_zyx = crop_zyxzyx[3:6] - crop_zyxzyx[:3]
+                pred = rescale_pred_to_org(pred, out_size_zyx)
 
-            out = np.full(list(img_size_zyx), tgt_min_val, np.float32)
-            out[
-                crop_zyxzyx[0] : crop_zyxzyx[3],
-                crop_zyxzyx[1] : crop_zyxzyx[4],
-                crop_zyxzyx[2] : crop_zyxzyx[5],
-            ] = pred
+                out = np.full(list(img_size_zyx), tgt_min_val, np.float32)
+                out[
+                    crop_zyxzyx[0] : crop_zyxzyx[3],
+                    crop_zyxzyx[1] : crop_zyxzyx[4],
+                    crop_zyxzyx[2] : crop_zyxzyx[5],
+                ] = pred
 
-            save_path = save_dir / f"{key}.pred.hdr"
-            save_raw(_to_int16(out), spacing_zyx, save_path)
+                save_path = save_dir / f"{key}.pred.hdr"
+                save_raw(_to_int16(out), spacing_zyx, save_path)
